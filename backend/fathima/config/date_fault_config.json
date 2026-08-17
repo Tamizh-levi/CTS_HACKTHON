@@ -1,0 +1,24 @@
+{
+    "features": [
+        "year",
+        "month",
+        "day",
+        "day_of_week",
+        "day_of_year"
+    ],
+    "targets": [
+        "severity_0",
+        "severity_1",
+        "severity_2"
+    ],
+    "severity_mapping": {
+        "0": "HIGH",
+        "1": "MEDIUM",
+        "2": "LOW"
+    },
+    "sla_targets": {
+        "HIGH": 5,
+        "MEDIUM": 10,
+        "LOW": 24
+    }
+}
