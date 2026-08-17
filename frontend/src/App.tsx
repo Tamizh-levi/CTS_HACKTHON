@@ -10,6 +10,7 @@ import Login from './pages/Login';
 import NocDashboard from './pages/Nocdashboard';
 import NocDetails from './pages/Nocdetails';
 import AdminDashboard from './pages/Admindashboard';
+import AdminPredict from './pages/AdminPredict';
 
 
 
@@ -70,6 +71,22 @@ function App() {
           element={
             <ProtectedRoute>
               <AdminDashboard />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/admin-predict"
+          element={
+            <ProtectedRoute>
+              <AdminPredict />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/admin/predict"
+          element={
+            <ProtectedRoute>
+              <AdminPredict />
             </ProtectedRoute>
           }
         />

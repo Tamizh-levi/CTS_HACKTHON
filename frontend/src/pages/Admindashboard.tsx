@@ -28,9 +28,11 @@ import {
   ShieldCheck,
   Sliders,
   Layers,
-  ChevronRight
+  ChevronRight,
+  Sparkles
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
+import AdminChatBot from '../components/AdminChatBot';
 
 interface MongoUser {
   id: string;
@@ -397,6 +399,23 @@ export default function AdminDashboard() {
             <Radio size={14} color="#38bdf8" />
             <span>NOC Operator Console</span>
           </button> */}
+
+          <button
+            onClick={() => navigate('/admin-predict')}
+            className="btn-secondary"
+            style={{
+              padding: '7px 14px',
+              fontSize: '12px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              borderColor: 'rgba(56, 189, 248, 0.4)',
+              color: '#38bdf8'
+            }}
+          >
+            <Sparkles size={14} color="#38bdf8" />
+            <span>SLA & Workload Forecaster</span>
+          </button>
 
           <button
             onClick={() => setShowAddUserModal(true)}
@@ -2090,6 +2109,9 @@ export default function AdminDashboard() {
           </div>
         </div>
       )}
+
+      {/* Floating NOC AI Chatbot Popup */}
+      <AdminChatBot />
     </div>
   );
 }

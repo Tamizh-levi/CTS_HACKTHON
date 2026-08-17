@@ -3,6 +3,8 @@ from flask_cors import CORS
 
 from auth.auth_routes import auth_bp
 from rag.receiver import receiver_bp
+from fathima.predict_date import predict_date_bp
+from sqlagent.noc import noc_bp
 
 
 # ============================================================
@@ -48,6 +50,32 @@ app.register_blueprint(
 app.register_blueprint(
 
     receiver_bp,
+
+    url_prefix="/api"
+
+)
+
+
+# ============================================================
+# REGISTER SLA & DATE FAULT PREDICTION BLUEPRINT
+# ============================================================
+
+app.register_blueprint(
+
+    predict_date_bp,
+
+    url_prefix="/api"
+
+)
+
+
+# ============================================================
+# REGISTER NOC / SQL AGENT BLUEPRINT
+# ============================================================
+
+app.register_blueprint(
+
+    noc_bp,
 
     url_prefix="/api"
 
