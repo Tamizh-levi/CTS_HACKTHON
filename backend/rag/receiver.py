@@ -31,6 +31,8 @@ generate_rca = None
 load_reference_data = None
 assign_dispatch = None
 process_feedback = None
+workflow = None
+WORKFLOW_AVAILABLE = False
 
 try:
     from backend.rag.agents.rca_engine import generate_rca
@@ -74,6 +76,20 @@ except Exception:
                 "reason": reason,
                 "assigned_group": "NOC_ENGINEERING_TEAM"
             }
+
+try:
+    from backend.rag.agents.graph.workflow import build_graph
+    workflow = build_graph()
+    WORKFLOW_AVAILABLE = True
+    print("[RECEIVER] LangGraph workflow initialized")
+except Exception:
+    try:
+        from agents.graph.workflow import build_graph
+        workflow = build_graph()
+        WORKFLOW_AVAILABLE = True
+        print("[RECEIVER] LangGraph workflow initialized")
+    except Exception as e:
+        print(f"[RECEIVER] LangGraph workflow notice: {e}")
 
 
 # ============================================================
@@ -591,12 +607,32 @@ def predict_and_rca():
         # Step 1: ML Pipeline
         ml_result = execute_ml_pipeline(data)
 
-        # Step 2: RCA Pipeline
+        # Step 2: LangGraph orchestration. It pauses before feedback; the
+        # existing /feedback endpoint supplies the operator decision and resumes it.
         ml_output = build_rca_input(data, ml_result)
         rca_result = None
         rca_status = "success"
+        dispatch_result = None
+        graph_completed = False
 
-        if generate_rca and RCA_ENGINE_AVAILABLE:
+        if WORKFLOW_AVAILABLE and workflow is not None:
+            try:
+                config = {"configurable": {"thread_id": str(data["id"])}}
+                graph_state = workflow.invoke({
+                    "input_data": data,
+                    "ml_output": ml_output,
+                    "attempt": 0,
+                    "status": "STARTED",
+                    "feedback_fixed": None,
+                    "memory_saved": False,
+                }, config=config)
+                rca_result = graph_state.get("rca_report")
+                dispatch_result = graph_state.get("dispatch_result")
+                graph_completed = True
+            except Exception as exc:
+                print(f"[RECEIVER] LangGraph execution notice: {exc}. Using resilient fallback.")
+                rca_result = generate_fallback_rca(ml_output)
+        elif generate_rca and RCA_ENGINE_AVAILABLE:
             try:
                 rca_result = generate_rca(ml_output)
             except Exception as e:
@@ -605,23 +641,21 @@ def predict_and_rca():
         else:
             rca_result = generate_fallback_rca(ml_output)
 
-        # Step 3: Dispatch Pipeline
-        dispatch_result = None
-        try:
-            if load_reference_data and assign_dispatch:
-                technicians, spare_parts = load_reference_data()
-                top_candidate = rca_result["ranked_causes"][0] if rca_result and "ranked_causes" in rca_result and rca_result["ranked_causes"] else {}
-                fault_for_dispatch = {
-                    "id": data["id"],
-                    "location": data["location"],
-                    "resource_type": data["resource_type"],
-                    "fault_severity": ml_result["fault_severity"],
-                    "root_cause": top_candidate.get("root_cause", "Optical link failure"),
-                    "recommended_solution": top_candidate.get("resolution", "Splice fiber cable")
-                }
-                dispatch_result = assign_dispatch(fault_for_dispatch, technicians, spare_parts)
-        except Exception as e:
-            print(f"[RECEIVER] Dispatch calculation notice: {e}")
+        # Backwards-compatible direct orchestration when LangGraph is not installed.
+        if not graph_completed:
+            try:
+                if load_reference_data and assign_dispatch:
+                    technicians, spare_parts = load_reference_data()
+                    top_candidate = rca_result["ranked_causes"][0] if rca_result and rca_result.get("ranked_causes") else {}
+                    fault_for_dispatch = {
+                        "id": data["id"], "location": data["location"],
+                        "resource_type": data["resource_type"], "fault_severity": ml_result["fault_severity"],
+                        "root_cause": top_candidate.get("root_cause", "Optical link failure"),
+                        "recommended_solution": top_candidate.get("resolution", "Splice fiber cable"),
+                    }
+                    dispatch_result = assign_dispatch(fault_for_dispatch, technicians, spare_parts)
+            except Exception as e:
+                print(f"[RECEIVER] Dispatch calculation notice: {e}")
 
         # Construct response
         response_data = {
@@ -705,7 +739,12 @@ def submit_feedback():
     try:
         data = request.get_json(silent=True) or {}
         ticket_id = data.get("ticket_id")
-        confirmed = data.get("confirmed", True)
+        confirmed_raw = data.get("confirmed", True)
+        confirmed = (
+            confirmed_raw
+            if isinstance(confirmed_raw, bool)
+            else str(confirmed_raw).strip().lower() in {"true", "1", "yes"}
+        )
         root_cause = data.get("root_cause", "")
         rank = data.get("rank", 1)
         notes = data.get("notes", "")
@@ -715,6 +754,24 @@ def submit_feedback():
         status_value = "FINISHED (RESOLVED)" if confirmed else "RE_ANALYZING"
         commit_id = f"COMMIT-RCA-{ticket_id}-{int(datetime.now(timezone.utc).timestamp())}"
         now_iso = datetime.now(timezone.utc).isoformat()
+        graph_state = None
+
+        # Preserve this endpoint's request/response contract while resuming the
+        # checkpointed graph created by /predict-and-rca.
+        if WORKFLOW_AVAILABLE and workflow is not None and ticket_id is not None:
+            config = {"configurable": {"thread_id": str(ticket_id)}}
+            try:
+                workflow.update_state(config, {"feedback_fixed": bool(confirmed)})
+                graph_state = workflow.invoke(None, config=config)
+                graph_status = graph_state.get("status")
+                if graph_status == "ESCALATED":
+                    status_value = "FINISHED (ESCALATED)"
+                elif graph_status in {"CLOSED", "MEMORY_SAVED"}:
+                    status_value = "FINISHED (RESOLVED)"
+            except Exception as exc:
+                # The legacy MongoDB feedback behavior still works if a caller
+                # submits feedback for an older/non-graph incident.
+                print(f"[RECEIVER] LangGraph feedback resume notice: {exc}")
 
         # Update in-memory SAMPLE_INCIDENTS
         for inc in SAMPLE_INCIDENTS:

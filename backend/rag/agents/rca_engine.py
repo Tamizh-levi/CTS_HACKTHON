@@ -7,6 +7,7 @@ import re
 from dotenv import load_dotenv
 
 from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 
@@ -86,6 +87,29 @@ llm = ChatOllama(
     temperature=0,
     format="json"
 )
+
+# LangChain owns the RCA prompt/LLM chain; LangGraph invokes this component
+# from its RCA node and owns the wider dispatch/feedback control flow.
+RCA_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """You are a senior Telecom Network Root Cause Analysis expert.
+Use only the supplied incident, telecom knowledge, and historical evidence.
+Generate exactly three different ranked hypotheses. Every hypothesis must include
+rank, root_cause, resolution, confidence (0 to 1), and evidence. Return only JSON
+with ranked_causes, technical_summary, and risk_level. Do not invent evidence."""),
+    ("human", """CURRENT INCIDENT:
+{incident}
+
+TELECOM KNOWLEDGE:
+{knowledge_context}
+
+HISTORICAL PATTERN ANALYSIS:
+{pattern_analysis}
+
+RAW HISTORICAL PATTERNS:
+{pattern_context}"""),
+])
+
+rca_chain = RCA_PROMPT | llm
 
 
 # ==========================================================
@@ -793,11 +817,12 @@ Required format:
 
     try:
 
-        final_response = (
-            llm.invoke(
-                final_prompt
-            )
-        )
+        final_response = rca_chain.invoke({
+            "incident": semantic_query,
+            "knowledge_context": knowledge_context,
+            "pattern_analysis": pattern_analysis,
+            "pattern_context": pattern_context,
+        })
 
         final_content = (
             extract_text(
@@ -978,6 +1003,10 @@ Required format:
 
         "semantic_incident":
             semantic_incident,
+
+        "knowledge_context": [doc.page_content for doc in knowledge_docs],
+
+        "pattern_context": [doc.page_content for doc in pattern_docs],
 
         "pattern_analysis":
             pattern_analysis
