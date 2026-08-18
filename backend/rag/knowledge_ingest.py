@@ -72,9 +72,8 @@ print(f"Knowledge Documents: {len(documents)}")
 # ==========================================
 
 embeddings = HuggingFaceEmbeddings(
-    model_name=r"C:\Users\sakthi murugan\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots\1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
-
 # ==========================================
 # STORE IN CHROMA
 # ==========================================
