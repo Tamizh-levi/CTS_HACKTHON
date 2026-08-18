@@ -1,27 +1,19 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Calendar,
   Sparkles,
   TrendingUp,
-  Activity,
   AlertTriangle,
   Clock,
-  CheckCircle2,
   BarChart3,
-  Sliders,
   ShieldAlert,
-  ArrowLeft,
-  ArrowRight,
   Download,
-  Filter,
   RefreshCw,
   LogOut,
   UserCheck,
   Zap,
-  Layers,
-  Search,
-  Server
+  Search
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
 

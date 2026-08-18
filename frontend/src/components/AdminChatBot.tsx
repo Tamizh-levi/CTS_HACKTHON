@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Bot,
   Send,
@@ -12,8 +12,7 @@ import {
   Check,
   Loader2,
   Layers,
-  Minimize2,
-  Table
+  Minimize2
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
 
