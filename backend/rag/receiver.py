@@ -1,14 +1,24 @@
+# backend/rag/receiver.py
+"""
+Telecom Fault Detection, RCA & Autonomous Dispatch API Gateway.
+Coordinates XGBoost Machine Learning, LangGraph State Machine,
+Direct ChromaDB + Ollama RCA Engine, MongoDB Incident & Decision Persistence.
+Single source of truth: MongoDB Database.
+"""
+
 import os
 import sys
+import json
 import traceback
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
-import numpy as np
 import joblib
+import numpy as np
+import pandas as pd
 import xgboost as xgb
 from flask import Blueprint, jsonify, request
+from pymongo import MongoClient
 
 # ============================================================
 # RESOLVE IMPORT PATHS
@@ -23,715 +33,431 @@ for path in [CURRENT_DIR, BACKEND_DIR, ROOT_DIR]:
         sys.path.insert(0, path)
 
 # ============================================================
-# RCA ENGINE & DISPATCH AGENTS IMPORT
+# LANGGRAPH WORKFLOW & DOMAIN AGENTS
 # ============================================================
 
-RCA_ENGINE_AVAILABLE = False
-generate_rca = None
-load_reference_data = None
-assign_dispatch = None
-process_feedback = None
 workflow = None
 WORKFLOW_AVAILABLE = False
 
 try:
-    from backend.rag.agents.rca_engine import generate_rca
-    RCA_ENGINE_AVAILABLE = True
-    print("[RECEIVER] Imported generate_rca from backend.rag.agents.rca_engine")
-except Exception:
     try:
-        from agents.rca_engine import generate_rca
-        RCA_ENGINE_AVAILABLE = True
-        print("[RECEIVER] Imported generate_rca from agents.rca_engine")
-    except Exception as e:
-        print(f"[RECEIVER] RCA Engine direct import notice: {e}")
+        from backend.rag.agents.graph.workflow import workflow
+    except ImportError:
+        try:
+            from rag.agents.graph.workflow import workflow
+        except ImportError:
+            from agents.graph.workflow import workflow
+    WORKFLOW_AVAILABLE = workflow is not None
+    print("[RECEIVER] LangGraph Checkpointed Workflow successfully loaded.")
+except Exception as e:
+    print(f"[RECEIVER WARNING] LangGraph workflow not loaded: {e}")
+    workflow = None
+    WORKFLOW_AVAILABLE = False
+
+# ============================================================
+# FLASK BLUEPRINT
+# ============================================================
+
+receiver_bp = Blueprint("receiver", __name__)
+
+# ============================================================
+# MONGODB CONFIGURATION & CLIENT
+# ============================================================
+
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017")
+MONGO_DB_NAME = "cts_incident_management"
+mongo_client = None
+mongo_db = None
 
 try:
-    from backend.rag.agents.dispatch_agent import load_reference_data, assign_dispatch
-except Exception:
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+    mongo_client.admin.command("ping")
+    mongo_db = mongo_client[MONGO_DB_NAME]
+    print(f"[RECEIVER] MongoDB Connected successfully to database '{MONGO_DB_NAME}'")
+except Exception as e:
+    print(f"[RECEIVER WARNING] MongoDB connection failed: {e}.")
+    mongo_db = None
+
+def get_mongo_db():
+    global mongo_db, mongo_client
+    if mongo_db is not None:
+        return mongo_db
     try:
-        from agents.dispatch_agent import load_reference_data, assign_dispatch
-    except Exception as e:
-        print(f"[RECEIVER] Dispatch Agent import notice: {e}")
-
-try:
-    from backend.rag.agents.feedback_agent import process_feedback
-except Exception:
-    try:
-        from agents.feedback_agent import process_feedback
-    except Exception as e:
-        print(f"[RECEIVER] Feedback Agent import notice: {e}")
-
-try:
-    from backend.rag.agents.escalation_agent import escalate
-except Exception:
-    try:
-        from agents.escalation_agent import escalate
-    except Exception as e:
-        print(f"[RECEIVER] Escalation Agent import notice: {e}")
-        def escalate(ticket, reason="Issue not resolved after all RCA recommendations."):
-            return {
-                "ticket_id": str(ticket.get("ticket_id", "UNKNOWN")),
-                "status": "ESCALATED",
-                "reason": reason,
-                "assigned_group": "NOC_ENGINEERING_TEAM"
-            }
-
-try:
-    from backend.rag.agents.graph.workflow import build_graph
-    workflow = build_graph()
-    WORKFLOW_AVAILABLE = True
-    print("[RECEIVER] LangGraph workflow initialized")
-except Exception:
-    try:
-        from agents.graph.workflow import build_graph
-        workflow = build_graph()
-        WORKFLOW_AVAILABLE = True
-        print("[RECEIVER] LangGraph workflow initialized")
-    except Exception as e:
-        print(f"[RECEIVER] LangGraph workflow notice: {e}")
-
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=1000)
+        mongo_db = mongo_client[MONGO_DB_NAME]
+        return mongo_db
+    except Exception:
+        return None
 
 # ============================================================
-# BLUEPRINT
+# ML ARTIFACT PATHS (EXPERIMENT 37 XGBOOST)
 # ============================================================
 
-receiver_bp = Blueprint(
-    "receiver",
-    __name__
-)
+_MODEL_DIR_CANDIDATES = [
+    os.path.join(BACKEND_DIR, "models", "models"),
+    os.path.join(CURRENT_DIR, "..", "models", "models"),
+    os.path.join(ROOT_DIR, "backend", "models", "models"),
+    r"E:\CTS_HACKTHON (3)\CTS_HACKTHON\backend\models\models",
+    os.path.join(ROOT_DIR, "models", "models")
+]
 
+MODELS_DIR = next((d for d in _MODEL_DIR_CANDIDATES if os.path.exists(d)), os.path.join(BACKEND_DIR, "models", "models"))
+PREPROCESSOR_PATH = os.path.join(MODELS_DIR, "experiment_37_preprocessor.joblib")
+MODEL_PATH = os.path.join(MODELS_DIR, "xgboost_fault_severity_model.json")
 
-# ============================================================
-# CONFIGURATION & PATHS
-# ============================================================
-
-MODEL_PATH = (
-    r"C:\Users\sadik\best model"
-    r"\experiment_37_results"
-    r"\experiment_37_best_xgboost.json"
-)
-
-PREPROCESSOR_PATH = (
-    r"C:\Users\sadik\best model"
-    r"\experiment_37_results"
-    r"\experiment_37_preprocessor.joblib"
-)
-
-SEVERITY_NAMES = {
-    0: "Low Severity",
-    1: "Medium Severity",
-    2: "High Severity"
-}
-
+print("[RECEIVER] Preprocessor Path:", PREPROCESSOR_PATH)
+print("[RECEIVER] Model Path       :", MODEL_PATH)
 
 # ============================================================
-# LOAD XGBOOST MODEL & PREPROCESSOR
+# LOAD MACHINE LEARNING MODEL
 # ============================================================
 
-print("\n" + "=" * 60)
-print("LOADING TELECOM FAULT SEVERITY MODEL")
-print("=" * 60)
-
-model = None
 preprocessor = None
-expected_features = []
+model = None
+MODEL_AVAILABLE = False
 
 try:
-    model = xgb.XGBClassifier()
-    model.load_model(MODEL_PATH)
-    print("XGBoost model loaded successfully.")
+    if os.path.exists(PREPROCESSOR_PATH) and os.path.exists(MODEL_PATH):
+        preprocessor = joblib.load(PREPROCESSOR_PATH)
+        model = xgb.XGBClassifier()
+        model.load_model(MODEL_PATH)
+        MODEL_AVAILABLE = True
+        print("[RECEIVER] ML Model & Preprocessor Loaded Successfully!")
+    else:
+        print(f"[RECEIVER WARNING] Model files missing: {PREPROCESSOR_PATH} or {MODEL_PATH}")
 except Exception as e:
-    print(f"WARNING: Failed to load XGBoost model from {MODEL_PATH}: {e}")
+    print(f"[RECEIVER ERROR] Failed to load ML Model: {e}")
 
-try:
-    preprocessor = joblib.load(PREPROCESSOR_PATH)
-    expected_features = list(preprocessor.feature_names_in_)
-    print(f"Preprocessor loaded successfully. Expected raw features: {len(expected_features)}")
-except Exception as e:
-    print(f"WARNING: Failed to load Preprocessor from {PREPROCESSOR_PATH}: {e}")
-    # Default fallback feature list if file missing
-    expected_features = [
-        "location", "severity_type", "resource_type",
-        "event_count_x", "unique_event_count", "log_feature_count",
-        "unique_log_features", "total_log_volume", "mean_log_volume",
-        "max_log_volume", "min_log_volume", "event_count_y",
-        "event_event_type_unique", "log_count", "log_log_feature_unique",
-        "log_volume_unique", "resource_count", "resource_resource_type_unique",
-        "log_count_ratio", "resource_count_ratio", "severity_resource",
-        "severity_location", "resource_location"
-    ]
-
+# ============================================================
+# PAYLOAD VALIDATION
+# ============================================================
 
 REQUIRED_FIELDS = [
     "id", "location", "severity_type", "resource_type",
     "event_count_x", "unique_event_count", "log_feature_count",
-    "unique_log_features", "total_log_volume", "mean_log_volume",
-    "max_log_volume", "min_log_volume", "event_count_y",
+    "unique_log_features", "event_count_y",
     "event_event_type_unique", "log_count", "log_log_feature_unique",
     "log_volume_unique", "resource_count", "resource_resource_type_unique",
     "log_count_ratio", "resource_count_ratio", "severity_resource",
     "severity_location", "resource_location"
 ]
 
+def validate_fault_data(data: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    if not isinstance(data, dict):
+        return False, {"error": "Invalid format: Payload must be a JSON object"}
 
-# ============================================================
-# MONGODB DATABASE CONFIGURATION (Stores Incidents & Operator Decisions)
-# ============================================================
-import pymongo
-
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-DB_NAME = os.getenv("MONGO_DB_NAME", "cts_incident_management")
-
-mongo_client = None
-mongo_db = None
-
-
-def get_mongo_db():
-    global mongo_client, mongo_db
-    if mongo_db is not None:
-        return mongo_db
-    try:
-        mongo_client = pymongo.MongoClient(
-            MONGO_URI,
-            serverSelectionTimeoutMS=2500
-        )
-        mongo_client.admin.command('ping')
-        mongo_db = mongo_client[DB_NAME]
-        return mongo_db
-    except Exception as e:
-        return None
-
-
-# ============================================================
-# DYNAMIC INCIDENTS STORE (Populated Live by sender.py & MongoDB)
-# ============================================================
-
-SAMPLE_INCIDENTS = []
-
-
-
-
-# ============================================================
-# VALIDATE INPUT
-# ============================================================
-
-def validate_fault_data(payload: dict):
     missing_fields = []
     for field in REQUIRED_FIELDS:
-        if field not in payload:
+        if field not in data:
             missing_fields.append(field)
+
+    # Check volume fields
+    if "total_log_volume" not in data and "volume" not in data:
+        missing_fields.append("total_log_volume")
 
     if missing_fields:
         return False, {
-            "message": "Missing required fields",
+            "error": "Missing required fields",
             "missing_fields": missing_fields
         }
+
     return True, None
 
-
 # ============================================================
-# CORE ML PIPELINE
+# ML PREDICTION PIPELINE
 # ============================================================
 
-def execute_ml_pipeline(data: dict) -> Dict[str, Any]:
-    payload = dict(data)
+SEVERITY_LABELS = {
+    0: "Low Severity",
+    1: "Medium Severity",
+    2: "High Severity"
+}
 
+def execute_ml_pipeline(data: Dict[str, Any]) -> Dict[str, Any]:
     if model is None or preprocessor is None:
-        # Fallback simulation if model weights not found on system
-        vol = float(payload.get("total_log_volume", 50))
-        ev = float(payload.get("event_count_x", 1))
-        if vol > 100 or ev > 3:
-            pred = 2
-            conf = 0.94
-            probs = {"low": 0.02, "medium": 0.04, "high": 0.94}
-        elif vol > 30:
-            pred = 1
-            conf = 0.85
-            probs = {"low": 0.10, "medium": 0.85, "high": 0.05}
-        else:
-            pred = 0
-            conf = 0.91
-            probs = {"low": 0.91, "medium": 0.07, "high": 0.02}
+        raise RuntimeError(
+            "XGBoost model or preprocessor is not loaded. "
+            "Cannot perform real fault prediction."
+        )
 
-        return {
-            "fault_severity": pred,
-            "severity": SEVERITY_NAMES[pred],
-            "confidence": conf,
-            "probabilities": probs
-        }
+    df = pd.DataFrame([data])
+    if "total_log_volume" not in df.columns and "volume" in df.columns:
+        df["total_log_volume"] = df["volume"]
 
-    # Prepare DataFrame
-    feature_df = pd.DataFrame([payload])[expected_features]
+    expected_features = getattr(preprocessor, "feature_names_in_", None)
+    if expected_features is not None:
+        for feat in expected_features:
+            if feat not in df.columns:
+                df[feat] = 0.0
+        df = df[expected_features]
 
-    categorical_features = [
-        "location", "severity_type", "resource_type",
-        "severity_resource", "severity_location", "resource_location"
-    ]
+    X_transformed = preprocessor.transform(df)
+    pred_class = int(model.predict(X_transformed)[0])
+    pred_probs = model.predict_proba(X_transformed)[0]
+    confidence = float(np.max(pred_probs))
 
-    for column in categorical_features:
-        if column in feature_df.columns:
-            feature_df[column] = feature_df[column].fillna("UNKNOWN").astype(str)
-
-    for column in feature_df.columns:
-        if column not in categorical_features:
-            feature_df[column] = (
-                pd.to_numeric(feature_df[column], errors="coerce")
-                .replace([np.inf, -np.inf], np.nan)
-                .fillna(0)
-            )
-
-    X = preprocessor.transform(feature_df)
-
-    probabilities = model.predict_proba(X)
-    prediction = int(np.argmax(probabilities, axis=1)[0])
-    severity = SEVERITY_NAMES.get(prediction, "Unknown")
-    confidence = float(np.max(probabilities[0]))
-
-    return {
-        "fault_severity": prediction,
-        "severity": severity,
-        "confidence": round(confidence, 4),
-        "probabilities": {
-            "low": round(float(probabilities[0][0]), 4),
-            "medium": round(float(probabilities[0][1]), 4),
-            "high": round(float(probabilities[0][2]), 4)
-        }
+    prob_dict = {
+        "low": float(round(pred_probs[0], 4)) if len(pred_probs) > 0 else 0.0,
+        "medium": float(round(pred_probs[1], 4)) if len(pred_probs) > 1 else 0.0,
+        "high": float(round(pred_probs[2], 4)) if len(pred_probs) > 2 else 0.0,
     }
 
-
-# ============================================================
-# BUILD RCA INPUT
-# ============================================================
-
-def build_rca_input(data: dict, ml_result: dict) -> dict:
     return {
-        "severity_type": data.get("severity_type", "severity_type 2"),
-        "resource_type": data.get("resource_type", "resource_type 2"),
-        "event_types": data.get("event_types", ["event_type 32"]),
-        "log_features": data.get("log_features", ["log_feature 234"]),
-        "predicted_fault_severity": ml_result["fault_severity"],
-        "volume": data.get("total_log_volume", 98)
+        "fault_severity": pred_class,
+        "severity": SEVERITY_LABELS.get(pred_class, "Unknown Severity"),
+        "confidence": float(round(confidence, 4)),
+        "probabilities": prob_dict
     }
 
-
-# ============================================================
-# FALLBACK / SYNTHETIC AGENTIC RCA GENERATOR
-# ============================================================
-
-def generate_fallback_rca(ml_output: dict) -> dict:
-    res_type = str(ml_output.get("resource_type", ""))
-    sev = ml_output.get("predicted_fault_severity", 1)
-
-    if sev == 2 or "5" in res_type:
-        risk = "CRITICAL"
-        summary = (
-            "Telemetry analysis shows severe signal degradation and persistent loss of frame alignment "
-            "across the optical transmission link. Multiple queue overflow and interface error events confirm physical link failure."
-        )
-        ranked = [
-            {
-                "rank": 1,
-                "root_cause": "Fiber Cut / Optical Cable Severance",
-                "confidence": 0.94,
-                "resolution": "Dispatch optical field technician with OTDR splicer kit to locate fault coordinates and splice cable."
-            },
-            {
-                "rank": 2,
-                "root_cause": "SFP+ Optical Transceiver Laser Diode Burnout",
-                "confidence": 0.82,
-                "resolution": "Hot-swap the transceiver module on port 0/1/1 and execute clean loopback verification test."
-            },
-            {
-                "rank": 3,
-                "root_cause": "Line Card Power Plane Brownout",
-                "confidence": 0.65,
-                "resolution": "Reseat line card in chassis slot 3 and verify DC bus bar voltage tolerances."
-            }
-        ]
-    elif sev == 1:
-        risk = "WARNING"
-        summary = (
-            "Detected transient packet drop spikes and protocol keepalive timeouts on edge aggregation switches. "
-            "Traffic telemetry points to high queue depth and localized buffer exhaustion."
-        )
-        ranked = [
-            {
-                "rank": 1,
-                "root_cause": "BGP Route Table Convergence Storm & Memory Saturation",
-                "confidence": 0.89,
-                "resolution": "Apply soft reconfiguration on BGP peer group and enable prefix-limit damping."
-            },
-            {
-                "rank": 2,
-                "root_cause": "Micro-burst Traffic Ingress Overwhelming Switch ASIC Buffer",
-                "confidence": 0.78,
-                "resolution": "Adjust Weighted Random Early Detection (WRED) profile and throttle QoS queue 4."
-            },
-            {
-                "rank": 3,
-                "root_cause": "Spanning Tree Protocol (STP) Topology Flapping",
-                "confidence": 0.61,
-                "resolution": "Enforce BPDU guard on edge access ports and verify root bridge priority settings."
-            }
-        ]
-    else:
-        risk = "NORMAL"
-        summary = (
-            "Periodic keepalive warning detected. System telemetry indicates nominal operating parameters "
-            "with transient telemetry polling delay."
-        )
-        ranked = [
-            {
-                "rank": 1,
-                "root_cause": "SNMP Polling Agent Timeout",
-                "confidence": 0.92,
-                "resolution": "Adjust telemetry collection frequency from 10s to 30s."
-            },
-            {
-                "rank": 2,
-                "root_cause": "Routine Log Buffer Rollover",
-                "confidence": 0.75,
-                "resolution": "No hardware action required. Automatic housekeeping in effect."
-            }
-        ]
-
+def build_rca_input(data: Dict[str, Any], ml_result: Dict[str, Any]) -> Dict[str, Any]:
+    vol = data.get("total_log_volume", data.get("volume", 0))
     return {
-        "risk_level": risk,
-        "technical_summary": summary,
-        "ranked_causes": ranked
+        **data,
+        "incident_id": data.get("id"),
+        "predicted_fault_severity": ml_result.get("fault_severity", 2),
+        "fault_severity": ml_result.get("fault_severity", 2),
+        "severity": ml_result.get("severity", "High Severity"),
+        "confidence": ml_result.get("confidence", 0.92),
+        "volume": vol,
+        "total_log_volume": vol,
     }
 
-
 # ============================================================
-# API ROUTES
-# ============================================================
-
-@receiver_bp.route("/", methods=["GET"])
-def root():
-    return jsonify({
-        "status": "online",
-        "service": "Telecom Fault Management API",
-        "framework": "Flask"
-    })
-
-
-@receiver_bp.route("/health", methods=["GET"])
-def health():
-    return jsonify({
-        "status": "healthy",
-        "rca_engine_available": RCA_ENGINE_AVAILABLE,
-        "model_loaded": model is not None,
-        "preprocessor_features_expected": len(expected_features),
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-
-
-@receiver_bp.route("/system-stats", methods=["GET"])
-def system_stats():
-    return jsonify({
-        "success": True,
-        "model": {
-            "name": "XGBoost Telecom Fault Severity Classifier",
-            "experiment": "Experiment 37 Best Tuned",
-            "features_count": len(expected_features),
-            "status": "Active & Serving",
-            "accuracy": "96.4%",
-            "inference_latency_ms": 14.2
-        },
-        "rag": {
-            "vector_db": "ChromaDB",
-            "knowledge_entries": 1420,
-            "pattern_memory_entries": 388,
-            "llm_model": "telecom-copilot (Ollama)",
-            "status": "Operational"
-        },
-        "agents": [
-            {"name": "ML Severity Agent", "status": "Online", "mode": "Inference"},
-            {"name": "RCA Knowledge Agent", "status": "Online", "mode": "RAG"},
-            {"name": "Autonomous Dispatch Agent", "status": "Online", "mode": "Proximity/Skill"},
-            {"name": "Memory & Feedback Agent", "status": "Online", "mode": "Self-Learning"}
-        ],
-        "active_technicians_count": 28,
-        "open_tickets_count": len(SAMPLE_INCIDENTS)
-    })
-
-
-@receiver_bp.route("/incidents", methods=["GET"])
-def get_incidents():
-    global SAMPLE_INCIDENTS
-    try:
-        db_conn = get_mongo_db()
-        merged_incidents = []
-        seen_ticket_ids = set()
-
-        # 1. Fetch all persisted old incidents from MongoDB
-        if db_conn is not None:
-            try:
-                db_incidents = list(db_conn["incidents"].find({}, {"_id": False}))
-                for doc in db_incidents:
-                    t_id = str(doc.get("ticket_id") or doc.get("id", "")).replace("INC-", "").strip()
-                    if t_id:
-                        seen_ticket_ids.add(t_id)
-                        merged_incidents.append(doc)
-            except Exception as ex:
-                print(f"[RECEIVER] Mongo incident list error: {ex}")
-
-        # 2. Merge any in-memory incidents not yet in MongoDB or freshly arrived
-        for inc in SAMPLE_INCIDENTS:
-            t_id = str(inc.get("ticket_id") or inc.get("id", "")).replace("INC-", "").strip()
-            if t_id not in seen_ticket_ids:
-                seen_ticket_ids.add(t_id)
-                merged_incidents.insert(0, inc)
-            else:
-                # Update with latest memory status if matching
-                for i, existing in enumerate(merged_incidents):
-                    if str(existing.get("ticket_id") or existing.get("id", "")).replace("INC-", "").strip() == t_id:
-                        merged_incidents[i] = inc
-                        break
-
-        # Keep SAMPLE_INCIDENTS populated
-        if merged_incidents:
-            SAMPLE_INCIDENTS = list(merged_incidents)
-
-        return jsonify({
-            "success": True,
-            "total": len(merged_incidents),
-            "incidents": merged_incidents,
-            "database": "cts_incident_management (MongoDB)" if db_conn is not None else "In-Memory Buffer"
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "total": len(SAMPLE_INCIDENTS),
-            "incidents": SAMPLE_INCIDENTS,
-            "error": str(e)
-        })
-
-
-@receiver_bp.route("/incidents/<incident_id>", methods=["GET"])
-def get_incident(incident_id):
-    clean_id = str(incident_id).replace("INC-", "").strip().lower()
-    
-    # Check in memory first
-    for inc in SAMPLE_INCIDENTS:
-        if str(inc.get("id", "")).lower() == str(incident_id).lower() or str(inc.get("ticket_id", "")).lower() == clean_id:
-            return jsonify({
-                "success": True,
-                "incident": inc
-            })
-
-    # If not in memory, query MongoDB
-    db_conn = get_mongo_db()
-    if db_conn is not None:
-        try:
-            numeric_id = int(clean_id) if clean_id.isdigit() else clean_id
-            doc = db_conn["incidents"].find_one({
-                "$or": [
-                    {"ticket_id": clean_id},
-                    {"ticket_id": numeric_id},
-                    {"id": incident_id},
-                    {"id": f"INC-{clean_id}"}
-                ]
-            }, {"_id": False})
-            if doc:
-                return jsonify({
-                    "success": True,
-                    "incident": doc
-                })
-        except Exception as ex:
-            print(f"[RECEIVER] Mongo get_incident lookup error: {ex}")
-
-    return jsonify({
-        "success": False,
-        "message": f"Incident {incident_id} not found in database or live telemetry queue."
-    }), 404
-
-
-
-
-# ============================================================
-# PREDICT ENDPOINT
+# API ENDPOINT 1: PREDICT ONLY
 # ============================================================
 
 @receiver_bp.route("/predict", methods=["POST"])
-def predict():
+def predict_only():
     try:
         data = request.get_json(silent=True)
         if not data:
-            return jsonify({
-                "success": False,
-                "message": "Request body must contain JSON data"
-            }), 400
+            return jsonify({"success": False, "message": "Request body must contain JSON data"}), 400
 
         valid, error = validate_fault_data(data)
         if not valid:
             return jsonify({"success": False, **error}), 400
 
         ml_result = execute_ml_pipeline(data)
-
         return jsonify({
-            "status": "success",
-            "id": data["id"],
-            **ml_result
+            "success": True,
+            "ticket_id": data.get("id"),
+            "prediction": ml_result
         })
-
     except Exception as e:
         traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "message": "Prediction failed",
-            "error": str(e)
-        }), 500
-
+        return jsonify({"success": False, "message": "Prediction failed", "error": str(e)}), 500
 
 # ============================================================
-# PREDICT + RCA + DISPATCH ENDPOINT
+# API ENDPOINT 2: PREDICT + RCA + DISPATCH (SINGLE ORCHESTRATION)
+# ============================================================
+
+def process_single_incident(data: Dict[str, Any]) -> Dict[str, Any]:
+    valid, error = validate_fault_data(data)
+    if not valid:
+        raise ValueError(f"Validation error for record #{data.get('id')}: {error.get('missing_fields', error.get('error'))}")
+
+    # Step 1: Execute Real ML Prediction
+    ml_result = execute_ml_pipeline(data)
+
+    # Step 2: Build RCA Input
+    ml_output = build_rca_input(data, ml_result)
+
+    # Step 3: Single LangGraph Orchestration Path
+    if not WORKFLOW_AVAILABLE or workflow is None:
+        raise RuntimeError("LangGraph workflow is unavailable.")
+
+    config = {
+        "configurable": {
+            "thread_id": str(data["id"])
+        }
+    }
+
+    graph_state = workflow.invoke(
+        {
+            "input_data": data,
+            "ml_output": ml_output,
+            "attempt": 0,
+            "status": "STARTED",
+            "feedback_fixed": None,
+            "selected_rank": None,
+            "confirmed_root_cause": "",
+            "confirmed_resolution": "",
+            "operator_notes": "",
+            "operator": "SYSTEM",
+            "memory_saved": False
+        },
+        config=config
+    )
+
+    rca_result = graph_state.get("rca_report")
+    dispatch_result = graph_state.get("dispatch_result")
+    workflow_status = graph_state.get("status", "AWAITING_FEEDBACK")
+
+    if not rca_result:
+        raise RuntimeError(f"Workflow completed without RCA result for #{data.get('id')}.")
+
+    if not rca_result.get("ranked_causes"):
+        raise RuntimeError(f"RCA result contains no ranked_causes for #{data.get('id')}.")
+
+    # Step 4: Construct complete incident document
+    new_inc = {
+        **data,
+        "id": f"INC-{data['id']}",
+        "ticket_id": data["id"],
+        "title": f"Telemetry Alert at {data.get('location', 'Node')} ({data.get('resource_type', 'Resource')})",
+        "location": data.get("location", "Unknown Location"),
+        "region": dispatch_result.get("region", "region_1") if dispatch_result else "region_1",
+        "severity_type": data.get("severity_type", "severity_type 1"),
+        "resource_type": data.get("resource_type", "resource_type 1"),
+        "event_types": data.get("event_types", []),
+        "log_features": data.get("log_features", []),
+        "total_log_volume": data.get("total_log_volume", data.get("volume", 0)),
+        "status": workflow_status,
+        "severity": ml_result.get("severity", "High Severity"),
+        "fault_severity": ml_result.get("fault_severity", 2),
+        "confidence": ml_result.get("confidence", 0.92),
+        "prediction": ml_result,
+        "agent_result": rca_result,
+        "dispatch_result": dispatch_result,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "assigned_to": (
+            dispatch_result["technician"]["technician_name"]
+            if dispatch_result and dispatch_result.get("technician")
+            else "Pending Autonomous Dispatch"
+        )
+    }
+
+    # Step 5: Save into MongoDB
+    db_conn = get_mongo_db()
+    if db_conn is not None:
+        try:
+            clean_doc = dict(new_inc)
+            db_conn["incidents"].update_one(
+                {"ticket_id": data["id"]},
+                {"$set": clean_doc},
+                upsert=True
+            )
+            print(f"[RECEIVER] Stored incident #{data['id']} in MongoDB 'incidents' collection.")
+        except Exception as ex:
+            print(f"[RECEIVER] MongoDB store error: {ex}")
+
+    return {
+        "success": True,
+        "status": "success",
+        "ticket_id": data["id"],
+        "prediction": ml_result,
+        "rca_status": "success",
+        "agent_result": rca_result,
+        "dispatch_result": dispatch_result
+    }
+
+# ============================================================
+# API ENDPOINT 2: PREDICT + RCA + DISPATCH (SUPPORTS SINGLE & BATCH)
 # ============================================================
 
 @receiver_bp.route("/predict-and-rca", methods=["POST"])
 def predict_and_rca():
     try:
-        data = request.get_json(silent=True)
-        if not data:
+        raw_body = request.get_json(silent=True)
+        if not raw_body:
+            return jsonify({"success": False, "message": "Request body must contain JSON data"}), 400
+
+        # Handle batch or single payloads
+        if isinstance(raw_body, dict) and "data" in raw_body and isinstance(raw_body["data"], list):
+            records = raw_body["data"]
+        elif isinstance(raw_body, list):
+            records = raw_body
+        elif isinstance(raw_body, dict):
+            records = [raw_body]
+        else:
+            return jsonify({"success": False, "message": "Invalid JSON format"}), 400
+
+        if not records:
+            return jsonify({"success": False, "message": "No incident records found in payload"}), 400
+
+        results = []
+        for record in records:
+            res = process_single_incident(record)
+            results.append(res)
+
+        if len(results) == 1:
+            return jsonify(results[0])
+        else:
             return jsonify({
-                "success": False,
-                "message": "Request body must contain JSON data"
-            }), 400
-
-        # Validate input
-        valid, error = validate_fault_data(data)
-        if not valid:
-            return jsonify({"success": False, **error}), 400
-
-        # Step 1: ML Pipeline
-        ml_result = execute_ml_pipeline(data)
-
-        # Step 2: LangGraph orchestration. It pauses before feedback; the
-        # existing /feedback endpoint supplies the operator decision and resumes it.
-        ml_output = build_rca_input(data, ml_result)
-        rca_result = None
-        rca_status = "success"
-        dispatch_result = None
-        graph_completed = False
-
-        if WORKFLOW_AVAILABLE and workflow is not None:
-            try:
-                config = {"configurable": {"thread_id": str(data["id"])}}
-                graph_state = workflow.invoke({
-                    "input_data": data,
-                    "ml_output": ml_output,
-                    "attempt": 0,
-                    "status": "STARTED",
-                    "feedback_fixed": None,
-                    "memory_saved": False,
-                }, config=config)
-                rca_result = graph_state.get("rca_report")
-                dispatch_result = graph_state.get("dispatch_result")
-                graph_completed = True
-            except Exception as exc:
-                print(f"[RECEIVER] LangGraph execution notice: {exc}. Using resilient fallback.")
-                rca_result = generate_fallback_rca(ml_output)
-        elif generate_rca and RCA_ENGINE_AVAILABLE:
-            try:
-                rca_result = generate_rca(ml_output)
-            except Exception as e:
-                print(f"[RECEIVER] Ollama/RAG RCA engine call exception: {e}. Using resilient knowledge fallback.")
-                rca_result = generate_fallback_rca(ml_output)
-        else:
-            rca_result = generate_fallback_rca(ml_output)
-
-        # Backwards-compatible direct orchestration when LangGraph is not installed.
-        if not graph_completed:
-            try:
-                if load_reference_data and assign_dispatch:
-                    technicians, spare_parts = load_reference_data()
-                    top_candidate = rca_result["ranked_causes"][0] if rca_result and rca_result.get("ranked_causes") else {}
-                    fault_for_dispatch = {
-                        "id": data["id"], "location": data["location"],
-                        "resource_type": data["resource_type"], "fault_severity": ml_result["fault_severity"],
-                        "root_cause": top_candidate.get("root_cause", "Optical link failure"),
-                        "recommended_solution": top_candidate.get("resolution", "Splice fiber cable"),
-                    }
-                    dispatch_result = assign_dispatch(fault_for_dispatch, technicians, spare_parts)
-            except Exception as e:
-                print(f"[RECEIVER] Dispatch calculation notice: {e}")
-
-        # Construct response
-        response_data = {
-            "success": True,
-            "status": "success",
-            "ticket_id": data["id"],
-            "prediction": ml_result,
-            "rca_status": rca_status,
-            "agent_result": rca_result,
-            "dispatch_result": dispatch_result
-        }
-
-        # Save / update complete incident payload from sender.py into SAMPLE_INCIDENTS
-        new_inc = {
-            **data,  # all features: id, event_types, log_features, location, severity_type, resource_type, event_count_x, total_log_volume, etc.
-            "id": f"INC-{data['id']}",
-            "ticket_id": data["id"],
-            "title": f"Telemetry Alert at {data.get('location', 'Node')} ({data.get('resource_type', 'Resource')})",
-            "location": data.get("location", "Unknown Location"),
-            "region": dispatch_result.get("region", "region_1") if dispatch_result else "region_1",
-            "severity_type": data.get("severity_type", "severity_type 1"),
-            "resource_type": data.get("resource_type", "resource_type 1"),
-            "event_types": data.get("event_types", []),
-            "log_features": data.get("log_features", []),
-            "total_log_volume": data.get("total_log_volume", 0),
-            "status": "INVESTIGATING",
-            "severity": ml_result.get("severity", "High Severity"),
-            "fault_severity": ml_result.get("fault_severity", 2),
-            "confidence": ml_result.get("confidence", 0.92),
-            "prediction": ml_result,
-            "agent_result": rca_result,
-            "dispatch_result": dispatch_result,
-            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "assigned_to": (
-                dispatch_result["technician"]["technician_name"]
-                if dispatch_result and dispatch_result.get("technician")
-                else "Pending Autonomous Dispatch"
-            )
-        }
-
-        # Update in-place if already present, or prepend if new
-        for i, existing in enumerate(SAMPLE_INCIDENTS):
-            if str(existing.get("ticket_id")) == str(data["id"]):
-                SAMPLE_INCIDENTS[i] = new_inc
-                break
-        else:
-            SAMPLE_INCIDENTS.insert(0, new_inc)
-
-        # Store / Upsert Incident in MongoDB
-        db_conn = get_mongo_db()
-        if db_conn is not None:
-            try:
-                clean_doc = dict(new_inc)
-                db_conn["incidents"].update_one(
-                    {"ticket_id": data["id"]},
-                    {"$set": clean_doc},
-                    upsert=True
-                )
-            except Exception as ex:
-                print(f"[RECEIVER] MongoDB incident store notice: {ex}")
-
-        return jsonify(response_data)
-
+                "success": True,
+                "status": "success",
+                "total_records": len(results),
+                "results": results
+            })
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({
             "success": False,
-            "status": "failed",
-            "message": "Incident processing failed",
+            "status": "RCA_FAILED",
+            "message": f"Processing failed: {str(e)}",
             "error": str(e)
         }), 500
 
+# ============================================================
+# API ENDPOINT 3: GET ALL INCIDENTS (DIRECT MONGODB QUERY)
+# ============================================================
+
+@receiver_bp.route("/incidents", methods=["GET"])
+def get_all_incidents():
+    db_conn = get_mongo_db()
+    if db_conn is not None:
+        try:
+            docs = list(db_conn["incidents"].find({}, {"_id": 0}).sort("created_at", -1))
+            return jsonify({"success": True, "incidents": docs, "count": len(docs)})
+        except Exception as ex:
+            print(f"[RECEIVER] MongoDB query error: {ex}")
+
+    return jsonify({"success": True, "incidents": [], "count": 0})
 
 # ============================================================
-# FEEDBACK & COMMIT ENDPOINT (Stored in MongoDB)
+# API ENDPOINT 4: GET SINGLE INCIDENT (DIRECT MONGODB QUERY)
+# ============================================================
+
+@receiver_bp.route("/incidents/<ticket_id>", methods=["GET"])
+def get_incident_by_id(ticket_id):
+    clean_id_str = str(ticket_id).replace("INC-", "").strip()
+
+    # Query MongoDB as single source of truth
+    db_conn = get_mongo_db()
+    if db_conn is not None:
+        try:
+            try:
+                query_id: Any = int(clean_id_str)
+            except ValueError:
+                query_id = clean_id_str
+
+            doc = db_conn["incidents"].find_one({
+                "$or": [
+                    {"ticket_id": query_id},
+                    {"ticket_id": clean_id_str},
+                    {"id": f"INC-{clean_id_str}"},
+                    {"id": clean_id_str}
+                ]
+            }, {"_id": 0})
+
+            if doc:
+                return jsonify({"success": True, "incident": doc})
+            else:
+                return jsonify({
+                    "success": False,
+                    "message": f"Incident #{ticket_id} not found."
+                }), 404
+        except Exception as ex:
+            print(f"[RECEIVER] MongoDB find error: {ex}")
+
+    return jsonify({
+        "success": False,
+        "message": f"Incident #{ticket_id} not found."
+    }), 404
+
+# ============================================================
+# API ENDPOINT 5: FEEDBACK & OPERATOR DECISION
 # ============================================================
 
 @receiver_bp.route("/feedback", methods=["POST"])
@@ -755,45 +481,125 @@ def submit_feedback():
         commit_id = f"COMMIT-RCA-{ticket_id}-{int(datetime.now(timezone.utc).timestamp())}"
         now_iso = datetime.now(timezone.utc).isoformat()
         graph_state = None
+        next_candidate = None
+        memory_result = None
+        escalation_result = None
 
-        # Preserve this endpoint's request/response contract while resuming the
-        # checkpointed graph created by /predict-and-rca.
-        if WORKFLOW_AVAILABLE and workflow is not None and ticket_id is not None:
-            config = {"configurable": {"thread_id": str(ticket_id)}}
-            try:
-                workflow.update_state(config, {"feedback_fixed": bool(confirmed)})
-                graph_state = workflow.invoke(None, config=config)
-                graph_status = graph_state.get("status")
-                if graph_status == "ESCALATED":
+        if not WORKFLOW_AVAILABLE or workflow is None:
+            raise RuntimeError("LangGraph workflow is unavailable to process feedback.")
+
+        if ticket_id is None:
+            raise ValueError("ticket_id is required for feedback.")
+
+        # Resume checkpointed LangGraph workflow
+        thread_id = str(ticket_id).replace("INC-", "").strip()
+        config = {"configurable": {"thread_id": thread_id}}
+
+        try:
+            # Rehydrate LangGraph workflow state if lost (e.g. server restart)
+            current_state = workflow.get_state(config)
+            db_conn = get_mongo_db()
+            inc_doc = None
+            past_decisions = []
+            if db_conn is not None:
+                try:
+                    clean_int = int(thread_id)
+                except (ValueError, TypeError):
+                    clean_int = None
+                conds = [{"ticket_id": thread_id}, {"id": f"INC-{thread_id}"}, {"id": thread_id}]
+                dec_conds = [{"ticket_id": thread_id}, {"ticket_id": str(ticket_id)}]
+                if clean_int is not None:
+                    conds.append({"ticket_id": clean_int})
+                    dec_conds.append({"ticket_id": clean_int})
+
+                inc_doc = db_conn["incidents"].find_one({"$or": conds})
+                past_decisions = list(db_conn["decisions"].find({"$or": dec_conds}))
+
+            # Extract rejected ranks from decisions table
+            existing_rejected = list(set([
+                int(d.get("selected_rank")) for d in past_decisions
+                if (d.get("decision_type") == "REJECT_CANDIDATE" or not d.get("confirmed")) and d.get("selected_rank") is not None
+            ]))
+
+            if not current_state.values or "ml_output" not in current_state.values:
+                if inc_doc:
+                    ml_out = inc_doc.get("prediction") or build_rca_input(inc_doc, inc_doc.get("prediction", {}))
+                    rca_rep = inc_doc.get("agent_result") or {}
+                    r_causes = rca_rep.get("ranked_causes", [])
+                    workflow.update_state(config, {
+                        "input_data": inc_doc,
+                        "ml_output": ml_out,
+                        "semantic_incident": rca_rep.get("semantic_incident", {}),
+                        "rca_report": rca_rep,
+                        "ranked_causes": r_causes,
+                        "current_candidate": r_causes[0] if r_causes else {},
+                        "dispatch_result": inc_doc.get("dispatch_result", {}),
+                        "ticket": {
+                            "ticket_id": str(ticket_id),
+                            "location": inc_doc.get("location"),
+                            "resource_type": inc_doc.get("resource_type"),
+                            "assigned_to": inc_doc.get("assigned_to"),
+                            "ranked_causes": r_causes,
+                            "attempt": len(existing_rejected),
+                            "rejected_ranks": existing_rejected
+                        },
+                        "status": "AWAITING_FEEDBACK"
+                    }, as_node="dispatch")
+
+            workflow.update_state(config, {
+                "feedback_fixed": bool(confirmed),
+                "selected_rank": int(rank) if rank else 1,
+                "confirmed_root_cause": root_cause,
+                "confirmed_resolution": resolution,
+                "operator_notes": notes,
+                "operator": operator,
+                "commit_id": commit_id if confirmed else None
+            })
+            graph_state = workflow.invoke(None, config=config)
+            graph_status = graph_state.get("status")
+            next_candidate = graph_state.get("current_candidate")
+            memory_result = graph_state.get("memory_result")
+            escalation_result = graph_state.get("escalation")
+
+            if graph_status == "ESCALATED":
+                status_value = "FINISHED (ESCALATED)"
+            elif graph_status in {"CLOSED", "MEMORY_SAVED"}:
+                status_value = "FINISHED (RESOLVED)"
+
+            # Ensure escalation status if all candidates are rejected
+            if not confirmed:
+                all_rejected = set(existing_rejected)
+                all_rejected.add(int(rank))
+                total_candidates = len(inc_doc.get("agent_result", {}).get("ranked_causes", [])) if inc_doc and "agent_result" in inc_doc else 3
+                if len(all_rejected) >= total_candidates or graph_status == "ESCALATED":
                     status_value = "FINISHED (ESCALATED)"
-                elif graph_status in {"CLOSED", "MEMORY_SAVED"}:
-                    status_value = "FINISHED (RESOLVED)"
-            except Exception as exc:
-                # The legacy MongoDB feedback behavior still works if a caller
-                # submits feedback for an older/non-graph incident.
-                print(f"[RECEIVER] LangGraph feedback resume notice: {exc}")
+                    if not escalation_result:
+                        escalation_result = {
+                            "ticket_id": str(ticket_id),
+                            "assigned_group": "NOC_ENGINEERING_TEAM (Tier-3)",
+                            "reason": f"All {total_candidates} automated RCA recommendations rejected by operator. Issue escalated to Tier-3 Senior NOC Team."
+                        }
+        except Exception as exc:
+            traceback.print_exc()
+            return jsonify({
+                "success": False,
+                "status": "FEEDBACK_WORKFLOW_FAILED",
+                "message": "Failed to resume LangGraph workflow.",
+                "error": str(exc)
+            }), 500
 
-        # Update in-memory SAMPLE_INCIDENTS
-        for inc in SAMPLE_INCIDENTS:
-            if str(inc.get("ticket_id")) == str(ticket_id) or str(inc.get("id")).replace("INC-", "") == str(ticket_id):
-                inc["status"] = status_value
-                if confirmed:
-                    inc["confirmed_root_cause"] = root_cause
-                    inc["finished_at"] = now_iso
-                    inc["resolution_type"] = "COMMITTED_BY_OPERATOR"
-                    inc["commit_id"] = commit_id
-                break
-
-        # STORE OPERATOR DECISION DIRECTLY INTO MONGODB
-        db_conn = get_mongo_db()
+        # Save operator decision strictly in decisions collection (do not mutate incidents collection)
         if db_conn is not None:
             try:
-                # 1. Record decision in 'decisions' collection
+                decision_type = "COMMIT_RESOLUTION" if confirmed else (
+                    "ESCALATION_TO_TIER_3" if status_value == "FINISHED (ESCALATED)" else "REJECT_CANDIDATE"
+                )
+
                 decision_doc = {
                     "ticket_id": ticket_id,
-                    "decision_type": "COMMIT_RESOLUTION" if confirmed else "REJECT_CANDIDATE",
+                    "decision_type": decision_type,
                     "confirmed": confirmed,
-                    "selected_rank": rank,
+                    "selected_rank": int(rank) if rank else 1,
                     "root_cause": root_cause,
                     "resolution": resolution,
                     "notes": notes,
@@ -803,162 +609,129 @@ def submit_feedback():
                     "timestamp": now_iso
                 }
                 db_conn["decisions"].insert_one(decision_doc)
-
-                # 2. Update status and resolution in 'incidents' collection
-                update_fields = {
-                    "status": status_value,
-                    "last_updated_at": now_iso
-                }
-                if confirmed:
-                    update_fields["confirmed_root_cause"] = root_cause
-                    update_fields["finished_at"] = now_iso
-                    update_fields["resolution_type"] = "COMMITTED_BY_OPERATOR"
-                    update_fields["commit_id"] = commit_id
-
-                numeric_id = int(ticket_id) if str(ticket_id).isdigit() else ticket_id
-                db_conn["incidents"].update_one(
-                    {"$or": [{"ticket_id": ticket_id}, {"ticket_id": numeric_id}, {"id": f"INC-{ticket_id}"}]},
-                    {"$set": update_fields}
-                )
-                print(f"[RECEIVER MONGODB] Saved operator decision for Ticket #{ticket_id} in MongoDB (Decision: {decision_doc['decision_type']}).")
+                print(f"[RECEIVER] Saved decision for incident #{ticket_id} to 'decisions' collection: {decision_type} ({status_value}).")
             except Exception as ex:
-                print(f"[RECEIVER MONGODB ERROR] Failed to save decision in MongoDB: {ex}")
+                print(f"[RECEIVER] MongoDB decision write error: {ex}")
 
         return jsonify({
             "success": True,
-            "ticket_id": ticket_id,
             "status": status_value,
-            "confirmed": confirmed,
-            "root_cause": root_cause,
-            "commit_id": commit_id,
-            "stored_in_mongodb": db_conn is not None,
-            "message": "Operator decision stored in MongoDB and resolution committed successfully." if confirmed else "Candidate rejected; recorded in MongoDB."
+            "commit_id": commit_id if confirmed else None,
+            "next_candidate": next_candidate,
+            "memory_saved": graph_state.get("memory_saved", False) if graph_state else bool(confirmed),
+            "memory_result": memory_result,
+            "escalation_result": escalation_result or (graph_state.get("escalation") if graph_state else None)
         })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
 
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"success": False, "message": "Feedback failed", "error": str(e)}), 500
 
 # ============================================================
-# ESCALATION AGENT ENDPOINT (Stored in MongoDB)
+# API ENDPOINT 6: ESCALATE (DIRECT ESCALATION FALLBACK)
 # ============================================================
 
 @receiver_bp.route("/escalate", methods=["POST"])
-def escalate_ticket():
+def direct_escalate():
     try:
         data = request.get_json(silent=True) or {}
-        ticket_id = data.get("ticket_id", "UNKNOWN")
-        reason = data.get("reason", "Issue not resolved after all RCA recommendations rejected by operator.")
-        operator = data.get("operator", "NOC Operator")
+        ticket_id = data.get("ticket_id")
+        reason = data.get("reason", "Operator escalated to Tier-3 NOC team.")
         now_iso = datetime.now(timezone.utc).isoformat()
 
-        escalation_result = escalate(
-            {"ticket_id": ticket_id},
-            reason=reason
-        )
-
-        status_value = "FINISHED (ESCALATED)"
-
-        # Update in-memory SAMPLE_INCIDENTS
-        for inc in SAMPLE_INCIDENTS:
-            if str(inc.get("ticket_id")) == str(ticket_id) or str(inc.get("id")).replace("INC-", "") == str(ticket_id):
-                inc["status"] = status_value
-                inc["assigned_to"] = "NOC Tier-3 Senior Engineering Team"
-                inc["finished_at"] = now_iso
-                inc["resolution_type"] = "ESCALATED_TO_TIER_3"
-                break
-
-        # STORE ESCALATION DECISION DIRECTLY INTO MONGODB
+        # Save escalation strictly in decisions collection (do not mutate incidents collection)
         db_conn = get_mongo_db()
         if db_conn is not None:
             try:
-                # 1. Record escalation in 'decisions' collection
-                escalation_doc = {
+                db_conn["decisions"].insert_one({
                     "ticket_id": ticket_id,
                     "decision_type": "ESCALATION_TO_TIER_3",
                     "reason": reason,
-                    "assigned_group": "NOC_ENGINEERING_TEAM",
-                    "escalation_result": escalation_result,
-                    "operator": operator,
-                    "status": status_value,
+                    "operator": data.get("operator", "NOC Operator"),
+                    "status": "FINISHED (ESCALATED)",
                     "timestamp": now_iso
-                }
-                db_conn["decisions"].insert_one(escalation_doc)
-
-                # 2. Update status in 'incidents' collection
-                numeric_id = int(ticket_id) if str(ticket_id).isdigit() else ticket_id
-                db_conn["incidents"].update_one(
-                    {"$or": [{"ticket_id": ticket_id}, {"ticket_id": numeric_id}, {"id": f"INC-{ticket_id}"}]},
-                    {"$set": {
-                        "status": status_value,
-                        "assigned_to": "NOC Tier-3 Senior Engineering Team",
-                        "finished_at": now_iso,
-                        "resolution_type": "ESCALATED_TO_TIER_3",
-                        "last_updated_at": now_iso
-                    }}
-                )
-                print(f"[RECEIVER MONGODB] Saved escalation decision for Ticket #{ticket_id} in MongoDB.")
+                })
+                print(f"[RECEIVER] Stored ESCALATION_TO_TIER_3 in 'decisions' collection for #{ticket_id}.")
             except Exception as ex:
-                print(f"[RECEIVER MONGODB ERROR] Failed to save escalation in MongoDB: {ex}")
+                print(f"[RECEIVER] MongoDB escalation write error: {ex}")
 
         return jsonify({
             "success": True,
+            "status": "FINISHED (ESCALATED)",
             "ticket_id": ticket_id,
-            "status": status_value,
-            "escalation": escalation_result,
-            "assigned_group": "NOC_ENGINEERING_TEAM",
-            "stored_in_mongodb": db_conn is not None,
-            "message": "Incident finished, escalated to Tier-3, and decision stored in MongoDB."
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-# ============================================================
-# GET ALL OPERATOR DECISIONS FROM MONGODB
-# ============================================================
-
-@receiver_bp.route("/decisions", methods=["GET"])
-def get_operator_decisions():
-    try:
-        db_conn = get_mongo_db()
-        if db_conn is None:
-            return jsonify({
-                "success": False,
-                "message": "MongoDB is offline",
-                "decisions": []
-            }), 503
-
-        records = list(db_conn["decisions"].find({}, {"_id": False}).sort("timestamp", -1))
-        return jsonify({
-            "success": True,
-            "total": len(records),
-            "decisions": records
+            "reason": reason,
+            "escalated_at": now_iso
         })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-
-
-
-
 # ============================================================
-# EXPORT
+# API ENDPOINT 7: DECISIONS LOG (DIRECT MONGODB QUERY)
 # ============================================================
 
-__all__ = [
-    "receiver_bp",
-    "execute_ml_pipeline",
-    "build_rca_input"
-]
+@receiver_bp.route("/decisions", methods=["GET"])
+def get_decisions_log():
+    db_conn = get_mongo_db()
+    if db_conn is not None:
+        try:
+            docs = list(db_conn["decisions"].find({}, {"_id": 0}).sort("timestamp", -1))
+            return jsonify({"success": True, "decisions": docs, "count": len(docs)})
+        except Exception as ex:
+            print(f"[RECEIVER] Decisions query error: {ex}")
+
+    return jsonify({"success": True, "decisions": [], "count": 0})
+
+@receiver_bp.route("/decisions/<ticket_id>", methods=["GET"])
+def get_decisions_by_ticket(ticket_id):
+    clean_id_str = str(ticket_id).replace("INC-", "").strip()
+    try:
+        query_id: Any = int(clean_id_str)
+    except ValueError:
+        query_id = clean_id_str
+
+    db_conn = get_mongo_db()
+    if db_conn is not None:
+        try:
+            docs = list(db_conn["decisions"].find({
+                "$or": [
+                    {"ticket_id": query_id},
+                    {"ticket_id": clean_id_str},
+                    {"ticket_id": f"INC-{clean_id_str}"}
+                ]
+            }, {"_id": 0}).sort("timestamp", 1))
+            return jsonify({"success": True, "ticket_id": ticket_id, "decisions": docs, "count": len(docs)})
+        except Exception as ex:
+            print(f"[RECEIVER] Single ticket decisions query error: {ex}")
+
+    return jsonify({"success": True, "ticket_id": ticket_id, "decisions": [], "count": 0})
+
+# ============================================================
+# SYSTEM HEALTH & STATS
+# ============================================================
+
+@receiver_bp.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "online",
+        "service": "Telecom Autonomous RCA & Dispatch Gateway",
+        "ml_model_loaded": MODEL_AVAILABLE,
+        "workflow_loaded": WORKFLOW_AVAILABLE,
+        "mongodb_connected": mongo_db is not None
+    })
+
+@receiver_bp.route("/system-stats", methods=["GET"])
+def system_stats():
+    db_conn = get_mongo_db()
+    total_count = 0
+    if db_conn is not None:
+        try:
+            total_count = db_conn["incidents"].count_documents({})
+        except Exception:
+            pass
+
+    return jsonify({
+        "success": True,
+        "total_incidents": total_count,
+        "ml_model": "xgboost_fault_severity_model.json",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })

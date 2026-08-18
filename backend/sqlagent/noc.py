@@ -12,7 +12,7 @@ MongoDB collection:
     collection: incidents
 
 Install:
-    pip install google-generativeai pymongo python-dotenv
+    pip install google-genai pymongo python-dotenv
 
 Environment variables:
     GEMINI_API_KEY
@@ -30,7 +30,7 @@ import difflib
 from typing import Any
 
 from flask import Blueprint, jsonify, request
-import google.generativeai as genai
+from google import genai
 from pymongo import MongoClient
 
 # ----------------------------------------------------------------------------
@@ -49,19 +49,14 @@ load_dotenv(os.path.join(BACKEND_DIR, ".env"))
 load_dotenv()
 
 api_key = os.environ.get("GEMINI_API_KEY")
-if api_key:
-    genai.configure(api_key=api_key)
 
-GEMINI_MODEL = None
-for model_candidate in ["gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-    try:
-        GEMINI_MODEL = genai.GenerativeModel(model_candidate)
-        break
-    except Exception:
-        continue
+if not api_key:
+    raise RuntimeError("GEMINI_API_KEY is not set")
 
-if GEMINI_MODEL is None:
-    GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+gemini_client = genai.Client(api_key=api_key)
+
+# Current Gemini model used by the new google-genai SDK.
+GEMINI_MODEL = "gemini-2.5-flash"
 
 MONGODB_URI = os.environ.get("MONGODB_URI", os.environ.get("MONGO_URI", "mongodb://localhost:27017"))
 MONGODB_DB = os.environ.get("MONGODB_DB", os.environ.get("MONGO_DB_NAME", "cts_incident_management"))
@@ -485,9 +480,10 @@ def normalize_with_gemini(question: str) -> str:
     if not GEMINI_MODEL:
         return normalize_question(question)
 
-    response = GEMINI_MODEL.generate_content(
-        QUESTION_NORMALIZE_PROMPT.format(question=question),
-        generation_config={
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=QUESTION_NORMALIZE_PROMPT.format(question=question),
+        config={
             "temperature": 0.0,
             "max_output_tokens": 120,
         },
@@ -519,9 +515,10 @@ def generate_query(question: str) -> dict[str, Any]:
         max_rows=MAX_ROWS,
     )
 
-    response = GEMINI_MODEL.generate_content(
-        prompt,
-        generation_config={
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config={
             "temperature": 0.0,
             "max_output_tokens": 700,
         },
@@ -781,14 +778,17 @@ If the result is empty, say no matching records were found."""
 def explain_result(question: str, rows: list[dict[str, Any]]) -> str:
     result_json = json.dumps(rows[:20], default=str)
 
-    response = GEMINI_MODEL.generate_content(
-        EXPLAIN_PROMPT.format(
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=EXPLAIN_PROMPT.format(
             question=question,
             result=result_json,
         ),
-        generation_config={
+        config={
             "temperature": 0.2,
-            "max_output_tokens": 200,
+            "max_output_tokens": 400,
+            "top_p":0.9,
+            "top_k":40
         },
     )
 

@@ -110,14 +110,14 @@ function App() {
         {/* ==================================================
             NOC DETAILS & RAG RCA CONSOLE (YES / NO REVIEW)
         ================================================== */}
-        <Route
+        {/* <Route
           path="/noc"
           element={
             <ProtectedRoute>
               <NocDetails />
             </ProtectedRoute>
           }
-        />
+        /> */}
         <Route
           path="/noc/:incidentId"
           element={

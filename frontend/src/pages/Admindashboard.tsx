@@ -165,15 +165,15 @@ export default function AdminDashboard() {
 
       if (userRes.ok) {
         const userData = await userRes.json();
-        if (userData.users) setUsers(userData.users);
+        if (Array.isArray(userData.users)) setUsers(userData.users);
       }
       if (incRes.ok) {
         const incData = await incRes.json();
-        if (incData.incidents) setIncidents(incData.incidents);
+        if (Array.isArray(incData.incidents)) setIncidents(incData.incidents);
       }
       if (decRes.ok) {
         const decData = await decRes.json();
-        if (decData.decisions) setDecisions(decData.decisions);
+        if (Array.isArray(decData.decisions)) setDecisions(decData.decisions);
       }
     } catch {
       // Retain existing state
@@ -222,6 +222,74 @@ export default function AdminDashboard() {
     }
   };
 
+  // Helper to look up all decisions for a ticket from the decisions table
+  const getTicketDecisions = (ticketId: number | string): OperatorDecision[] => {
+    const cleanId = String(ticketId || '').replace(/^INC-/i, '').trim();
+    if (!cleanId) return [];
+    return decisions.filter((d) => {
+      const decCleanId = String(d.ticket_id || '').replace(/^INC-/i, '').trim();
+      return decCleanId === cleanId;
+    });
+  };
+
+  const getIncidentEffectiveStatus = (inc: Incident): string => {
+    const ticketDecisions = getTicketDecisions(inc.ticket_id || inc.id);
+    if (ticketDecisions.length > 0) {
+      // 1. Check if there is any COMMIT_RESOLUTION in decisions table
+      const hasCommit = ticketDecisions.some(
+        (d) =>
+          d.decision_type === 'COMMIT_RESOLUTION' ||
+          d.confirmed === true ||
+          String(d.decision_type || '').toUpperCase().includes('COMMIT') ||
+          String(d.status || '').toUpperCase().includes('RESOLV') ||
+          String(d.status || '').toUpperCase().includes('COMMITT')
+      );
+      if (hasCommit) {
+        return 'FINISHED (RESOLVED)';
+      }
+
+      // 2. Check if there is an ESCALATION_TO_TIER_3 or if all 3 ranks (1, 2, 3) were rejected in decisions table
+      const hasEscalation = ticketDecisions.some(
+        (d) =>
+          d.decision_type === 'ESCALATION_TO_TIER_3' ||
+          String(d.decision_type || '').toUpperCase().includes('ESCALAT') ||
+          String(d.status || '').toUpperCase().includes('ESCALAT')
+      );
+      const rejectedRanks = new Set(
+        ticketDecisions
+          .filter((d) => d.decision_type === 'REJECT_CANDIDATE' || d.confirmed === false)
+          .map((d) => Number(d.selected_rank || 0))
+          .filter(Boolean)
+      );
+
+      if (hasEscalation || (rejectedRanks.has(1) && rejectedRanks.has(2) && rejectedRanks.has(3))) {
+        return 'FINISHED (ESCALATED)';
+      }
+
+      return 'PENDING REVIEW';
+    }
+
+    // Direct fallback from MongoDB incident document
+    const rawStatus = String(inc.status || '').toUpperCase();
+    if (rawStatus.includes('RESOLV') || rawStatus.includes('COMMITT') || rawStatus.includes('CLOSED')) {
+      return 'FINISHED (RESOLVED)';
+    }
+    if (rawStatus.includes('ESCALAT')) {
+      return 'FINISHED (ESCALATED)';
+    }
+
+    return 'PENDING REVIEW';
+  };
+
+  const isIncidentResolved = (inc: Incident) =>
+    getIncidentEffectiveStatus(inc) === 'FINISHED (RESOLVED)';
+
+  const isIncidentEscalated = (inc: Incident) =>
+    getIncidentEffectiveStatus(inc) === 'FINISHED (ESCALATED)';
+
+  const isIncidentPending = (inc: Incident) =>
+    getIncidentEffectiveStatus(inc) === 'PENDING REVIEW';
+
   // Helper calculations
   const totalOperatorsCount = users.length;
   const operatorRoleCount = users.filter((u) => u.role === 'operator').length;
@@ -232,24 +300,10 @@ export default function AdminDashboard() {
     (d) => d.decision_type === 'COMMIT_RESOLUTION' || d.confirmed === true
   ).length;
 
-  const totalSolvedCount = incidents.filter(
-    (i) => String(i.status || '').toUpperCase().includes('RESOLVED') || i.status === 'COMMITTED'
-  ).length;
-
-  const totalPendingCount = incidents.filter(
-    (i) =>
-      !String(i.status || '').toUpperCase().includes('RESOLVED') &&
-      !String(i.status || '').toUpperCase().includes('ESCALATED') &&
-      i.status !== 'COMMITTED'
-  ).length;
-
-  const totalEscalatedCount = incidents.filter((i) =>
-    String(i.status || '').toUpperCase().includes('ESCALATED')
-  ).length;
-
-  const escalatedIncidents = incidents.filter((i) =>
-    String(i.status || '').toUpperCase().includes('ESCALATED')
-  );
+  const totalSolvedCount = incidents.filter(isIncidentResolved).length;
+  const totalPendingCount = incidents.filter(isIncidentPending).length;
+  const totalEscalatedCount = incidents.filter(isIncidentEscalated).length;
+  const escalatedIncidents = incidents.filter(isIncidentEscalated);
 
   // Filtered Users
   const filteredUsers = users.filter((u) => {
@@ -271,10 +325,9 @@ export default function AdminDashboard() {
       String(inc.resource_type || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       String(inc.title || '').toLowerCase().includes(searchTerm.toLowerCase());
 
-    const isResolved =
-      String(inc.status || '').toUpperCase().includes('RESOLVED') || inc.status === 'COMMITTED';
-    const isEscalated = String(inc.status || '').toUpperCase().includes('ESCALATED');
-    const isPending = !isResolved && !isEscalated;
+    const isResolved = isIncidentResolved(inc);
+    const isEscalated = isIncidentEscalated(inc);
+    const isPending = isIncidentPending(inc);
 
     const matchesStatus =
       statusFilter === 'ALL' ||
@@ -287,8 +340,11 @@ export default function AdminDashboard() {
 
   // Open Pop-up Modal for Escalation Item
   const handleOpenEscalationModal = (inc: Incident) => {
+    const cleanId = String(inc.ticket_id || inc.id).replace('INC-', '').trim();
     const relatedDec = decisions.find(
-      (d) => String(d.ticket_id) === String(inc.ticket_id) && d.decision_type.includes('ESCALAT')
+      (d) =>
+        String(d.ticket_id).replace('INC-', '').trim() === cleanId &&
+        (d.decision_type.includes('ESCALAT') || String(d.status || '').includes('ESCALAT'))
     );
     setSelectedEscalation({
       incident: inc,
@@ -908,10 +964,8 @@ export default function AdminDashboard() {
                   </div>
                 ) : (
                   filteredIncidents.map((inc) => {
-                    const isResolved =
-                      String(inc.status || '').toUpperCase().includes('RESOLVED') ||
-                      inc.status === 'COMMITTED';
-                    const isEscalated = String(inc.status || '').toUpperCase().includes('ESCALATED');
+                    const isResolved = isIncidentResolved(inc);
+                    const isEscalated = isIncidentEscalated(inc);
 
                     return (
                       <div
@@ -946,21 +1000,35 @@ export default function AdminDashboard() {
                             style={{
                               fontSize: '11px',
                               fontWeight: 700,
-                              padding: '3px 8px',
-                              borderRadius: '10px',
+                              padding: '4px 10px',
+                              borderRadius: '12px',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '6px',
                               background: isResolved
-                                ? 'rgba(16, 185, 129, 0.2)'
+                                ? 'rgba(16, 185, 129, 0.15)'
                                 : isEscalated
-                                ? 'rgba(239, 68, 68, 0.2)'
-                                : 'rgba(245, 158, 11, 0.2)',
-                              color: isResolved ? '#34d399' : isEscalated ? '#f87171' : '#fbbf24'
+                                  ? 'rgba(239, 68, 68, 0.15)'
+                                  : 'rgba(245, 158, 11, 0.15)',
+                              color: isResolved ? '#34d399' : isEscalated ? '#f87171' : '#fbbf24',
+                              border: `1px solid ${isResolved
+                                  ? 'rgba(16, 185, 129, 0.35)'
+                                  : isEscalated
+                                    ? 'rgba(239, 68, 68, 0.35)'
+                                    : 'rgba(245, 158, 11, 0.35)'
+                                }`
                             }}
                           >
-                            {isResolved
-                              ? 'SOLVED (YES)'
-                              : isEscalated
-                              ? 'ESCALATED (3x NO)'
-                              : 'PENDING REVIEW'}
+                            {isResolved && <CheckCircle2 size={12} />}
+                            {isEscalated && <PhoneForwarded size={12} />}
+                            {!isResolved && !isEscalated && <Activity size={12} />}
+                            <span>
+                              {isResolved
+                                ? 'FINISHED (RESOLVED)'
+                                : isEscalated
+                                  ? 'ESCALATED'
+                                  : 'PENDING REVIEW'}
+                            </span>
                           </span>
 
                           {isEscalated && (
@@ -1011,27 +1079,8 @@ export default function AdminDashboard() {
                     fontSize: '12px'
                   }}
                 >
-                  <div
-                    style={{
-                      background: '#0d111a',
-                      padding: '12px',
-                      borderRadius: '8px',
-                      border: '1px solid rgba(255, 255, 255, 0.05)'
-                    }}
-                  >
-                    <div style={{ color: '#64748b' }}>DATABASE</div>
-                    <div
-                      style={{
-                        fontSize: '14px',
-                        fontWeight: 700,
-                        color: '#f8fafc',
-                        marginTop: '2px'
-                      }}
-                    >
-                      cts_incident_management
-                    </div>
-                  </div>
-                  <div
+
+                  {/* <div
                     style={{
                       background: '#0d111a',
                       padding: '12px',
@@ -1050,7 +1099,7 @@ export default function AdminDashboard() {
                     >
                       PBKDF2:SHA256
                     </div>
-                  </div>
+                  </div> */}
                   <div
                     style={{
                       background: '#0d111a',
@@ -1095,7 +1144,7 @@ export default function AdminDashboard() {
               </div>
 
               {/* Roles Breakdown */}
-              <div className="glass-panel" style={{ padding: '20px' }}>
+              {/* <div className="glass-panel" style={{ padding: '20px' }}>
                 <div
                   style={{
                     fontSize: '15px',
@@ -1151,7 +1200,7 @@ export default function AdminDashboard() {
                     <strong style={{ color: '#34d399' }}>{fieldRoleCount} active</strong>
                   </div>
                 </div>
-              </div>
+              </div> */}
             </div>
           </div>
         )}
@@ -1229,7 +1278,7 @@ export default function AdminDashboard() {
                     <th style={{ padding: '12px 20px' }}>Role</th>
                     <th style={{ padding: '12px 20px' }}>Department</th>
                     <th style={{ padding: '12px 20px' }}>Last Login</th>
-                    <th style={{ padding: '12px 20px' }}>Encryption</th>
+                    {/* <th style={{ padding: '12px 20px' }}>Encryption</th> */}
                   </tr>
                 </thead>
                 <tbody>
@@ -1253,14 +1302,14 @@ export default function AdminDashboard() {
                               u.role === 'admin'
                                 ? 'rgba(168, 85, 247, 0.2)'
                                 : u.role === 'field'
-                                ? 'rgba(16, 185, 129, 0.2)'
-                                : 'rgba(56, 189, 248, 0.2)',
+                                  ? 'rgba(16, 185, 129, 0.2)'
+                                  : 'rgba(56, 189, 248, 0.2)',
                             color:
                               u.role === 'admin'
                                 ? '#c084fc'
                                 : u.role === 'field'
-                                ? '#34d399'
-                                : '#38bdf8',
+                                  ? '#34d399'
+                                  : '#38bdf8',
                             textTransform: 'uppercase'
                           }}
                         >
@@ -1271,7 +1320,7 @@ export default function AdminDashboard() {
                       <td style={{ padding: '14px 20px', color: '#94a3b8', fontSize: '12px' }}>
                         {u.last_login_at || 'Never'}
                       </td>
-                      <td
+                      {/* <td
                         style={{
                           padding: '14px 20px',
                           color: '#34d399',
@@ -1283,7 +1332,7 @@ export default function AdminDashboard() {
                       >
                         <Lock size={12} />
                         <span>PBKDF2:SHA256 (MongoDB)</span>
-                      </td>
+                      </td> */}
                     </tr>
                   ))}
                 </tbody>
@@ -1353,16 +1402,16 @@ export default function AdminDashboard() {
                             background: isCommit
                               ? 'rgba(16, 185, 129, 0.2)'
                               : isEsc
-                              ? 'rgba(239, 68, 68, 0.2)'
-                              : 'rgba(245, 158, 11, 0.2)',
+                                ? 'rgba(239, 68, 68, 0.2)'
+                                : 'rgba(245, 158, 11, 0.2)',
                             color: isCommit ? '#34d399' : isEsc ? '#f87171' : '#fbbf24'
                           }}
                         >
                           {isCommit
                             ? 'COMMIT (YES)'
                             : isEsc
-                            ? 'ESCALATION (3x NO)'
-                            : 'REJECT (NO)'}
+                              ? 'ESCALATION (3x NO)'
+                              : 'REJECT (NO)'}
                         </span>
                       </div>
 
@@ -1999,48 +2048,36 @@ export default function AdminDashboard() {
                 </div>
 
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                  <div
-                    style={{
-                      padding: '8px 12px',
-                      background: '#0a0e17',
-                      borderRadius: '6px',
-                      fontSize: '12px',
-                      borderLeft: '3px solid #ef4444',
-                      display: 'flex',
-                      justifyContent: 'space-between'
-                    }}
-                  >
-                    <span>Option #1: Core Router Optical Transceiver Degradation</span>
-                    <span style={{ color: '#f87171', fontWeight: 700 }}>REJECTED (NO)</span>
-                  </div>
-                  <div
-                    style={{
-                      padding: '8px 12px',
-                      background: '#0a0e17',
-                      borderRadius: '6px',
-                      fontSize: '12px',
-                      borderLeft: '3px solid #ef4444',
-                      display: 'flex',
-                      justifyContent: 'space-between'
-                    }}
-                  >
-                    <span>Option #2: Transceiver Laser Degradation</span>
-                    <span style={{ color: '#f87171', fontWeight: 700 }}>REJECTED (NO)</span>
-                  </div>
-                  <div
-                    style={{
-                      padding: '8px 12px',
-                      background: '#0a0e17',
-                      borderRadius: '6px',
-                      fontSize: '12px',
-                      borderLeft: '3px solid #ef4444',
-                      display: 'flex',
-                      justifyContent: 'space-between'
-                    }}
-                  >
-                    <span>Option #3: Line Card Power Rail Brownout</span>
-                    <span style={{ color: '#f87171', fontWeight: 700 }}>REJECTED (NO)</span>
-                  </div>
+                  {((selectedEscalation.incident?.agent_result?.ranked_causes && Array.isArray(selectedEscalation.incident.agent_result.ranked_causes))
+                    ? selectedEscalation.incident.agent_result.ranked_causes.slice(0, 3)
+                    : [
+                      { rank: 1, root_cause: 'Radio Interface Hardware Degradation' },
+                      { rank: 2, root_cause: 'Optical Link Transceiver Degradation' },
+                      { rank: 3, root_cause: 'Backhaul Network Signal Loss' }
+                    ]
+                  ).map((cause: any, cIdx: number) => (
+                    <div
+                      key={cIdx}
+                      style={{
+                        padding: '10px 14px',
+                        background: '#0a0e17',
+                        borderRadius: '6px',
+                        fontSize: '12px',
+                        borderLeft: '3px solid #ef4444',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center'
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span style={{ fontWeight: 700, color: '#f87171' }}>Option #{cause.rank || cIdx + 1}:</span>
+                        <span style={{ color: '#f8fafc' }}>{cause.root_cause}</span>
+                      </div>
+                      <span style={{ color: '#f87171', fontWeight: 700, fontSize: '11px', background: 'rgba(239, 68, 68, 0.15)', padding: '2px 8px', borderRadius: '4px' }}>
+                        REJECTED (NO)
+                      </span>
+                    </div>
+                  ))}
                 </div>
               </div>
 

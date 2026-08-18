@@ -51,7 +51,7 @@ export default function Login() {
         const token = data.token || `token_telecom_${Date.now()}`;
         const userData = data.user || {
           username: username || 'operator',
-          name: username === 'admin' ? 'System Administrator' : 'Senior NOC Controller',
+          name: username === 'admin' ? 'NOC Administrator' : 'Senior NOC Controller',
           role: selectedRole,
           department: selectedRole === 'admin' ? 'Central Core Ops' : 'Tier-2 NOC Console',
         };
@@ -268,7 +268,7 @@ export default function Login() {
                   transition: 'all 0.15s ease'
                 }}
               >
-                System Admin
+                NOC Admin
               </button>
               {/* <button
                 type="button"

@@ -19,16 +19,79 @@ import {
   CheckCheck,
   RotateCcw,
   PhoneForwarded,
-  Info
+  Info,
+  AlertOctagon,
+  ChevronRight
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
+
+// Helper to cleanly format string/list/array outputs from Ollama / ChromaDB / LangGraph
+function parseListOrString(value: any): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    const flattened: string[] = [];
+    value.forEach((v) => {
+      flattened.push(...parseListOrString(v));
+    });
+    return flattened.filter(Boolean);
+  }
+
+  let str = String(value).trim();
+
+  // 1. Check if stringified python/JSON list: e.g. "['item1', 'item2']" or '["item1", "item2"]'
+  if ((str.startsWith('[') && str.endsWith(']')) || (str.startsWith('(') && str.endsWith(')'))) {
+    try {
+      const parsed = JSON.parse(str.replace(/'/g, '"'));
+      if (Array.isArray(parsed)) {
+        return parseListOrString(parsed);
+      }
+    } catch {
+      const items = str.slice(1, -1).split(/',\s*'|",\s*"/).map(s => s.replace(/^['"]|['"]$/g, '').trim());
+      if (items.length > 0) return items.filter(Boolean);
+    }
+  }
+
+  // 2. Check if newline-separated bullet list: e.g. "1. Step 1\n2. Step 2" or "- Item 1\n- Item 2"
+  if (str.includes('\n')) {
+    const lines = str.split('\n').map(l => l.replace(/^[-*•]\s*|^\d+[\.)]\s*/, '').trim()).filter(Boolean);
+    if (lines.length > 1) return lines;
+  }
+
+  // 3. Check if semicolon-separated points: "action 1; action 2; action 3"
+  if (str.includes(';')) {
+    const parts = str.split(';').map(p => p.trim()).filter(Boolean);
+    if (parts.length > 1) return parts;
+  }
+
+  // 4. Check if compound sentence with comma-separated action clauses:
+  // e.g. "Inspect radio interface status, check recent frequency or power changes, and review maintenance history."
+  // or "Check transport interface status, check for power or signal instability"
+  if (str.includes(', and ') || (str.includes(',') && /(?:check|inspect|review|verify|compare|replace|test|monitor|examine|reboot|reset|adjust)/i.test(str))) {
+    let normalized = str.replace(/,\s*and\s+/gi, '|||');
+    normalized = normalized.replace(/,\s*(?=(?:check|inspect|review|verify|compare|replace|test|monitor|examine|reboot|reset|adjust|[A-Z]))/gi, '|||');
+    const clauses = normalized.split('|||').map(c => {
+      let clean = c.trim().replace(/^and\s+/i, '').replace(/\.$/, '').trim();
+      if (clean.length > 0) {
+        clean = clean.charAt(0).toUpperCase() + clean.slice(1);
+      }
+      return clean;
+    }).filter(Boolean);
+    if (clauses.length > 1) {
+      return clauses;
+    }
+  }
+
+  // Remove trailing period for consistency
+  const singleClean = str.replace(/\.$/, '').trim();
+  return [singleClean || str];
+}
 
 interface RootCauseCandidate {
   rank: number;
   root_cause: string;
   confidence: number;
-  evidence?: string;
-  resolution: string;
+  evidence?: string | string[];
+  resolution: string | string[];
   status?: 'pending' | 'accepted' | 'rejected';
   rejectionReason?: string;
 }
@@ -96,7 +159,7 @@ export default function NocDetails() {
 
   // Active selected option index (0 = Option 1, 1 = Option 2, 2 = Option 3)
   const [selectedOptionIndex, setSelectedOptionIndex] = useState<number>(0);
-  
+
   // Track status of the 3 options
   const [optionsStatus, setOptionsStatus] = useState<{ [key: number]: 'pending' | 'accepted' | 'rejected' }>({
     1: 'pending',
@@ -155,8 +218,9 @@ export default function NocDetails() {
         setDispatchResult(loadedIncident.dispatch_result);
       }
 
+      let rawCauses: RootCauseCandidate[] = [];
       if (loadedIncident.agent_result && loadedIncident.agent_result.ranked_causes) {
-        const rawCauses: RootCauseCandidate[] = (loadedIncident.agent_result.ranked_causes || []).map(
+        rawCauses = (loadedIncident.agent_result.ranked_causes || []).map(
           (c: any, idx: number) => ({
             rank: c.rank || idx + 1,
             root_cause: c.root_cause || `Root cause candidate ${idx + 1}`,
@@ -186,7 +250,7 @@ export default function NocDetails() {
           if (rcaData.prediction) setPrediction(rcaData.prediction);
           if (rcaData.dispatch_result) setDispatchResult(rcaData.dispatch_result);
           if (rcaData.agent_result) {
-            const rawCauses: RootCauseCandidate[] = (rcaData.agent_result.ranked_causes || []).map(
+            rawCauses = (rcaData.agent_result.ranked_causes || []).map(
               (c: any, idx: number) => ({
                 rank: c.rank || idx + 1,
                 root_cause: c.root_cause || `Root cause candidate ${idx + 1}`,
@@ -205,11 +269,63 @@ export default function NocDetails() {
         }
       }
 
-      // Reset option states
-      setSelectedOptionIndex(0);
-      setOptionsStatus({ 1: 'pending', 2: 'pending', 3: 'pending' });
-      setCommittedOption(null);
-      setEscalationData(null);
+      // Query decisions collection for any existing decisions for this ticket
+      let existingDecisions: any[] = [];
+      try {
+        const decRes = await fetch(`${API_BASE_URL}/api/decisions/${ticketNumber}`);
+        if (decRes.ok) {
+          const decData = await decRes.json();
+          existingDecisions = Array.isArray(decData.decisions) ? decData.decisions : [];
+        }
+      } catch (e) {
+        console.warn('Could not fetch decisions:', e);
+      }
+
+      // Check if ticket already has commit or escalation in decisions table
+      const commitDec = existingDecisions.find((d: any) => d.decision_type === 'COMMIT_RESOLUTION' || d.confirmed === true);
+      const escDec = existingDecisions.find((d: any) => d.decision_type === 'ESCALATION_TO_TIER_3' || String(d.status).toUpperCase().includes('ESCALAT'));
+      const rejectedRanks = existingDecisions
+        .filter((d: any) => d.decision_type === 'REJECT_CANDIDATE' || d.confirmed === false)
+        .map((d: any) => Number(d.selected_rank || d.rank))
+        .filter(Boolean);
+
+      const statusMap: { [key: number]: 'pending' | 'accepted' | 'rejected' } = { 1: 'pending', 2: 'pending', 3: 'pending' };
+      rejectedRanks.forEach((r: number) => {
+        statusMap[r] = 'rejected';
+      });
+
+      if (escDec || (rejectedRanks.includes(1) && rejectedRanks.includes(2) && rejectedRanks.includes(3))) {
+        setEscalationData({
+          isEscalated: true,
+          reason: escDec?.reason || 'All automated RCA recommendations rejected by operator. Issue escalated to Senior Tier-3 NOC Team.',
+          assignedGroup: escDec?.assigned_group || 'NOC_ENGINEERING_TEAM (Tier-3)',
+          escalatedAt: escDec?.timestamp || loadedIncident.created_at || 'Archived',
+          ticketId: String(ticketNumber)
+        });
+        setCommittedOption(null);
+        setOptionsStatus({ 1: 'rejected', 2: 'rejected', 3: 'rejected' });
+        setSelectedOptionIndex(0);
+      } else if (commitDec) {
+        const targetRank = commitDec.selected_rank || 1;
+        const matchedCandidate = rawCauses.find((c: any) => c.rank === targetRank) || rawCauses[0];
+        setCommittedOption({
+          candidate: matchedCandidate,
+          commitId: commitDec.commit_id || `COMMIT-${ticketNumber}`,
+          committedAt: commitDec.timestamp || 'Committed'
+        });
+        statusMap[targetRank] = 'accepted';
+        setOptionsStatus(statusMap);
+        const acceptedIdx = rawCauses.findIndex((c: any) => c.rank === targetRank);
+        setSelectedOptionIndex(acceptedIdx !== -1 ? acceptedIdx : 0);
+        setEscalationData(null);
+      } else {
+        // Pending state
+        setOptionsStatus(statusMap);
+        setCommittedOption(null);
+        setEscalationData(null);
+        const firstUnrejectedIdx = rawCauses.findIndex((c: any) => statusMap[c.rank] !== 'rejected');
+        setSelectedOptionIndex(firstUnrejectedIdx !== -1 ? firstUnrejectedIdx : 0);
+      }
     } catch (err: any) {
       setErrorMessage(`Failed to connect to receiver at ${API_BASE_URL}: ${err.message}`);
     } finally {
@@ -300,7 +416,7 @@ export default function NocDetails() {
     setOptionalRejectNote('');
 
     // CHECK IF ALL 3 OPTIONS ARE NOW REJECTED
-    const allThreeRejected = 
+    const allThreeRejected =
       newStatusMap[1] === 'rejected' &&
       newStatusMap[2] === 'rejected' &&
       newStatusMap[3] === 'rejected';
@@ -472,7 +588,7 @@ export default function NocDetails() {
 
       {/* Main Content Area */}
       <div style={{ flex: 1, padding: '24px 28px', maxWidth: '1600px', width: '100%', margin: '0 auto', boxSizing: 'border-box' }}>
-        
+
         {/* Error Alert */}
         {errorMessage && (
           <div style={{
@@ -538,20 +654,19 @@ export default function NocDetails() {
                 background: escalationData
                   ? 'rgba(239, 68, 68, 0.2)'
                   : committedOption
-                  ? 'rgba(16, 185, 129, 0.2)'
-                  : 'rgba(56, 189, 248, 0.15)',
+                    ? 'rgba(16, 185, 129, 0.2)'
+                    : 'rgba(56, 189, 248, 0.15)',
                 color: escalationData
                   ? '#f87171'
                   : committedOption
-                  ? '#34d399'
-                  : '#38bdf8',
-                border: `1px solid ${
-                  escalationData
+                    ? '#34d399'
+                    : '#38bdf8',
+                border: `1px solid ${escalationData
                     ? 'rgba(239, 68, 68, 0.4)'
                     : committedOption
-                    ? 'rgba(16, 185, 129, 0.4)'
-                    : 'rgba(56, 189, 248, 0.3)'
-                }`
+                      ? 'rgba(16, 185, 129, 0.4)'
+                      : 'rgba(56, 189, 248, 0.3)'
+                  }`
               }}>
                 <span style={{
                   width: '7px',
@@ -587,7 +702,7 @@ export default function NocDetails() {
             <span>3-Option Root Cause Analysis & Escalation Workflow</span>
           </button>
 
-          <button
+          {/* <button
             onClick={() => setActiveTab('telemetry')}
             style={{
               background: 'none',
@@ -605,7 +720,7 @@ export default function NocDetails() {
           >
             <Activity size={16} />
             <span>Telemetry & ML Probabilities</span>
-          </button>
+          </button> */}
 
           <button
             onClick={() => setActiveTab('dispatch')}
@@ -627,7 +742,7 @@ export default function NocDetails() {
             <span>Autonomous Field Dispatch</span>
           </button>
 
-          <button
+          {/* <button
             onClick={() => setActiveTab('audit')}
             style={{
               background: 'none',
@@ -645,7 +760,7 @@ export default function NocDetails() {
           >
             <FileText size={16} />
             <span>Audit Trail</span>
-          </button>
+          </button> */}
         </div>
 
         {/* ============================================================
@@ -700,14 +815,6 @@ export default function NocDetails() {
                       <ArrowLeft size={14} />
                       <span>Return to Dashboard</span>
                     </button>
-                    <button
-                      onClick={handleResetEvaluation}
-                      className="btn-secondary"
-                      style={{ padding: '8px 12px', fontSize: '12px' }}
-                      title="Reset Review"
-                    >
-                      <RotateCcw size={13} />
-                    </button>
                   </div>
                 </div>
 
@@ -748,7 +855,7 @@ export default function NocDetails() {
 
             {/* MAIN 2-PANEL LAYOUT: LEFT = 3 OPTIONS SELECTOR, RIGHT = ELABORATE EXPLANATION */}
             <div style={{ display: 'grid', gridTemplateColumns: '380px 1fr', gap: '24px' }}>
-              
+
               {/* LEFT COLUMN: THE 3 RCA OPTIONS SELECTOR */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
                 <div style={{ fontSize: '14px', fontWeight: 700, color: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -774,17 +881,17 @@ export default function NocDetails() {
                         border: isSelected
                           ? '2px solid #38bdf8'
                           : isAccepted
-                          ? '1px solid #10b981'
-                          : isRejected
-                          ? '1px solid rgba(239, 68, 68, 0.3)'
-                          : '1px solid rgba(255, 255, 255, 0.08)',
+                            ? '1px solid #10b981'
+                            : isRejected
+                              ? '1px solid rgba(239, 68, 68, 0.3)'
+                              : '1px solid rgba(255, 255, 255, 0.08)',
                         backgroundColor: isSelected
                           ? 'rgba(56, 189, 248, 0.08)'
                           : isAccepted
-                          ? 'rgba(16, 185, 129, 0.05)'
-                          : isRejected
-                          ? 'rgba(239, 68, 68, 0.04)'
-                          : 'rgba(16, 22, 34, 0.6)',
+                            ? 'rgba(16, 185, 129, 0.05)'
+                            : isRejected
+                              ? 'rgba(239, 68, 68, 0.04)'
+                              : 'rgba(16, 22, 34, 0.6)',
                         transition: 'all 0.18s ease'
                       }}
                     >
@@ -856,7 +963,7 @@ export default function NocDetails() {
 
               {/* RIGHT COLUMN: ELABORATE EXPLANATION & EXECUTION REVIEW */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-                
+
                 {/* IF A ROOT CAUSE IS COMMITTED (WORK FINISHED) */}
                 {committedOption ? (
                   <div className="glass-panel" style={{
@@ -903,14 +1010,6 @@ export default function NocDetails() {
                           <ArrowLeft size={14} />
                           <span>Return to Dashboard</span>
                         </button>
-                        <button
-                          onClick={handleResetEvaluation}
-                          className="btn-secondary"
-                          style={{ padding: '8px 12px', fontSize: '12px' }}
-                          title="Re-evaluate"
-                        >
-                          <RotateCcw size={13} />
-                        </button>
                       </div>
                     </div>
 
@@ -926,11 +1025,32 @@ export default function NocDetails() {
                       </div>
 
                       <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid rgba(255, 255, 255, 0.06)' }}>
-                        <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 600, textTransform: 'uppercase' }}>
+                        <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 600, textTransform: 'uppercase', marginBottom: '8px' }}>
                           EXECUTED RESOLUTION PLAN & ACTION
                         </div>
-                        <div style={{ fontSize: '13px', color: '#e2e8f0', marginTop: '4px', lineHeight: '1.6' }}>
-                          {committedOption.candidate.resolution}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                          {(parseListOrString(committedOption.candidate.resolution).length > 0
+                            ? parseListOrString(committedOption.candidate.resolution)
+                            : [String(committedOption.candidate.resolution || 'Resolution executed.')]
+                          ).map((resStep, rIdx) => (
+                            <div
+                              key={rIdx}
+                              style={{
+                                background: 'rgba(16, 185, 129, 0.06)',
+                                border: '1px solid rgba(16, 185, 129, 0.2)',
+                                borderRadius: '6px',
+                                padding: '8px 12px',
+                                fontSize: '13px',
+                                color: '#e2e8f0',
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px'
+                              }}
+                            >
+                              <Check size={14} color="#34d399" />
+                              <span>{resStep}</span>
+                            </div>
+                          ))}
                         </div>
                       </div>
                     </div>
@@ -938,6 +1058,83 @@ export default function NocDetails() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#34d399', background: 'rgba(16, 185, 129, 0.1)', padding: '10px 14px', borderRadius: '6px' }}>
                       <CheckCircle2 size={16} />
                       <span>Incident work is finished. Field dispatch order dispatched to technician queue and logged to ChromaDB vector store.</span>
+                    </div>
+                  </div>
+                ) : escalationData ? (
+                  /* IF ESCALATED TO TIER-3 (WORK FINISHED - READ ONLY) */
+                  <div className="glass-panel" style={{
+                    padding: '28px',
+                    border: '2px solid #ef4444',
+                    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                    borderRadius: '12px',
+                    boxShadow: '0 0 35px rgba(239, 68, 68, 0.2)'
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '18px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <div style={{
+                          width: '44px',
+                          height: '44px',
+                          borderRadius: '10px',
+                          background: 'linear-gradient(135deg, #b91c1c, #ef4444)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: '#ffffff',
+                          boxShadow: '0 0 20px rgba(239, 68, 68, 0.4)'
+                        }}>
+                          <PhoneForwarded size={24} />
+                        </div>
+                        <div>
+                          <div style={{ fontSize: '20px', fontWeight: 800, color: '#f87171', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <span>ESCALATED TO TIER-3 (READ ONLY)</span>
+                            <span style={{ fontSize: '11px', background: 'rgba(239, 68, 68, 0.2)', border: '1px solid #ef4444', padding: '2px 8px', borderRadius: '12px', color: '#fca5a5' }}>
+                              LOCKED ARCHIVE
+                            </span>
+                          </div>
+                          <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '2px' }}>
+                            Ticket ID: <span className="mono-tag" style={{ color: '#38bdf8' }}>INC-{escalationData.ticketId}</span> | Handed off to: <strong style={{ color: '#f87171' }}>{escalationData.assignedGroup}</strong>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '8px' }}>
+                        <button
+                          onClick={() => navigate('/noc-dashboard')}
+                          className="btn-primary"
+                          style={{ padding: '8px 16px', fontSize: '12px', background: 'linear-gradient(135deg, #dc2626, #ef4444)' }}
+                        >
+                          <ArrowLeft size={14} />
+                          <span>Return to Dashboard</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div style={{ background: '#0d111a', borderRadius: '8px', padding: '18px', border: '1px solid rgba(239, 68, 68, 0.3)', marginBottom: '16px' }}>
+                      <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 600, textTransform: 'uppercase' }}>
+                        ESCALATION DIAGNOSTIC SUMMARY
+                      </div>
+                      <div style={{ fontSize: '15px', fontWeight: 700, color: '#f8fafc', marginTop: '4px' }}>
+                        All 3 automated RCA options rejected by operator
+                      </div>
+                      <div style={{ fontSize: '12px', color: '#fca5a5', marginTop: '4px', lineHeight: 1.5 }}>
+                        {escalationData.reason}
+                      </div>
+
+                      <div style={{ marginTop: '14px', paddingTop: '12px', borderTop: '1px solid rgba(255, 255, 255, 0.06)', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
+                        <div>
+                          <div style={{ fontSize: '10px', color: '#64748b', textTransform: 'uppercase' }}>Assigned Engineering Team</div>
+                          <div style={{ fontSize: '13px', color: '#f8fafc', fontWeight: 600, marginTop: '2px' }}>{escalationData.assignedGroup}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: '10px', color: '#64748b', textTransform: 'uppercase' }}>Escalation Timestamp</div>
+                          <div style={{ fontSize: '13px', color: '#cbd5e1', marginTop: '2px' }}>{escalationData.escalatedAt}</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#fca5a5', background: 'rgba(239, 68, 68, 0.1)', padding: '10px 14px', borderRadius: '6px' }}>
+                      <AlertOctagon size={16} />
+                      <span>This incident is locked in the MongoDB decisions audit log. Operator modification is disabled.</span>
                     </div>
                   </div>
                 ) : (
@@ -1007,13 +1204,41 @@ export default function NocDetails() {
                       marginBottom: '16px',
                       border: '1px solid rgba(255, 255, 255, 0.05)'
                     }}>
-                      <div style={{ fontSize: '11px', color: '#38bdf8', fontWeight: 700, textTransform: 'uppercase', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <div style={{ fontSize: '11px', color: '#38bdf8', fontWeight: 700, textTransform: 'uppercase', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
                         <Info size={14} />
                         <span>Elaborate Diagnostic Evidence & Telemetry Indicators</span>
                       </div>
-                      <div style={{ fontSize: '13px', color: '#cbd5e1', lineHeight: '1.6' }}>
-                        {currentOption.evidence ||
-                          'The event shows characteristic telemetry patterns across log features and event types. Historical pattern matching in ChromaDB indicates strong correlation with this root cause.'}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {(parseListOrString(currentOption.evidence).length > 0
+                          ? parseListOrString(currentOption.evidence)
+                          : ['The event shows characteristic telemetry patterns across log features and event types. Historical pattern matching in ChromaDB indicates strong correlation with this root cause.']
+                        ).map((evItem, evIdx) => (
+                          <div
+                            key={evIdx}
+                            style={{
+                              background: '#121826',
+                              border: '1px solid rgba(56, 189, 248, 0.15)',
+                              borderRadius: '6px',
+                              padding: '10px 12px',
+                              fontSize: '13px',
+                              color: '#cbd5e1',
+                              lineHeight: '1.5',
+                              display: 'flex',
+                              alignItems: 'flex-start',
+                              gap: '10px'
+                            }}
+                          >
+                            <span style={{
+                              width: '6px',
+                              height: '6px',
+                              borderRadius: '50%',
+                              backgroundColor: '#38bdf8',
+                              flexShrink: 0,
+                              marginTop: '6px'
+                            }} />
+                            <span style={{ flex: 1 }}>{evItem}</span>
+                          </div>
+                        ))}
                       </div>
                     </div>
 
@@ -1025,12 +1250,45 @@ export default function NocDetails() {
                       marginBottom: '20px',
                       border: '1px solid rgba(255, 255, 255, 0.05)'
                     }}>
-                      <div style={{ fontSize: '11px', color: '#10b981', fontWeight: 700, textTransform: 'uppercase', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <div style={{ fontSize: '11px', color: '#10b981', fontWeight: 700, textTransform: 'uppercase', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
                         <Wrench size={14} />
                         <span>Step-By-Step Execution & Resolution Plan</span>
                       </div>
-                      <div style={{ fontSize: '13px', color: '#e2e8f0', lineHeight: '1.6' }}>
-                        {currentOption.resolution}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {(parseListOrString(currentOption.resolution).length > 0
+                          ? parseListOrString(currentOption.resolution)
+                          : ['Apply standard telecom field diagnostics and module testing protocol.']
+                        ).map((stepItem, stepIdx) => (
+                          <div
+                            key={stepIdx}
+                            style={{
+                              background: 'rgba(16, 185, 129, 0.06)',
+                              border: '1px solid rgba(16, 185, 129, 0.2)',
+                              borderRadius: '6px',
+                              padding: '10px 14px',
+                              fontSize: '13px',
+                              color: '#e2e8f0',
+                              lineHeight: '1.5',
+                              display: 'flex',
+                              alignItems: 'flex-start',
+                              gap: '10px'
+                            }}
+                          >
+                            <span style={{
+                              fontSize: '10px',
+                              fontWeight: 800,
+                              background: '#059669',
+                              color: '#ffffff',
+                              padding: '2px 6px',
+                              borderRadius: '4px',
+                              flexShrink: 0,
+                              marginTop: '1px'
+                            }}>
+                              STEP {stepIdx + 1}
+                            </span>
+                            <span style={{ flex: 1 }}>{stepItem}</span>
+                          </div>
+                        ))}
                       </div>
                     </div>
 
@@ -1319,8 +1577,8 @@ export default function NocDetails() {
                     {escalationData
                       ? `All 3 options were rejected. Escalation Agent triggered and reassigned ticket to ${escalationData.assignedGroup}.`
                       : committedOption
-                      ? `Option #${committedOption.candidate.rank} (${committedOption.candidate.root_cause}) confirmed and executed properly.`
-                      : 'Operator currently evaluating the 3 options.'}
+                        ? `Option #${committedOption.candidate.rank} (${committedOption.candidate.root_cause}) confirmed and executed properly.`
+                        : 'Operator currently evaluating the 3 options.'}
                   </div>
                 </div>
               </div>

@@ -22,3 +22,7 @@ def build_graph():
     graph.add_edge("memory", END)
     graph.add_edge("escalation", END)
     return graph.compile(checkpointer=MemorySaver(), interrupt_before=["feedback"])
+
+
+workflow = build_graph()
+__all__ = ["build_graph", "workflow"]

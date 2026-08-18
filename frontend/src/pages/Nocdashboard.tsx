@@ -15,7 +15,7 @@ import {
   List,
   ArrowRight,
   FileText,
-  Eye
+  Eye,
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
 
@@ -62,17 +62,17 @@ export default function NocDashboard() {
   const navigate = useNavigate();
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [decisions, setDecisions] = useState<OperatorDecision[]>([]);
-  
+
   const [searchTerm, setSearchTerm] = useState('');
   const [severityFilter, setSeverityFilter] = useState<'ALL' | 'HIGH' | 'MED' | 'LOW'>('ALL');
-  
+
   // Dashboard Primary View Mode: INCIDENTS vs DECISIONS LOG
   const [activeConsoleView, setActiveConsoleView] = useState<'INCIDENTS' | 'DECISIONS'>('INCIDENTS');
 
   // The primary 4 categories: COMMON, PENDING, FINISH, ESCALATION
   const [selectedCategory, setSelectedCategory] = useState<MainCategory>('COMMON');
   const [viewMode, setViewMode] = useState<'table' | 'kanban'>('table');
-  
+
   const [loading, setLoading] = useState(true);
   const [currentUser, setCurrentUser] = useState<any>(null);
 
@@ -150,47 +150,83 @@ export default function NocDashboard() {
     navigate('/login');
   };
 
-  // Helper check for status categories
-  const isIncidentResolved = (status: string) => {
-    const s = String(status || '').toUpperCase();
-    return s.includes('RESOLVED') || s === 'COMMITTED';
+  // Helper to look up all decisions for a ticket from the decisions table
+  const getTicketDecisions = (ticketId: number | string): OperatorDecision[] => {
+    const cleanId = String(ticketId).replace('INC-', '').trim();
+    return decisions.filter(d => String(d.ticket_id).replace('INC-', '').trim() === cleanId);
   };
 
-  const isIncidentEscalated = (status: string) => {
-    const s = String(status || '').toUpperCase();
-    return s.includes('ESCALATED');
+  const getIncidentEffectiveStatus = (inc: Incident): string => {
+    const ticketDecisions = getTicketDecisions(inc.ticket_id || inc.id);
+    if (ticketDecisions.length > 0) {
+      // 1. Check if there is any COMMIT_RESOLUTION in decisions table
+      const hasCommit = ticketDecisions.some(
+        d => d.decision_type === 'COMMIT_RESOLUTION' || d.confirmed === true || String(d.status || '').toUpperCase().includes('RESOLV')
+      );
+      if (hasCommit) {
+        return 'FINISHED (RESOLVED)';
+      }
+
+      // 2. Check if there is an ESCALATION_TO_TIER_3 or if all 3 ranks (1, 2, 3) were rejected in decisions table
+      const hasEscalation = ticketDecisions.some(
+        d => d.decision_type === 'ESCALATION_TO_TIER_3' || String(d.status || '').toUpperCase().includes('ESCALAT')
+      );
+      const rejectedRanks = new Set(
+        ticketDecisions
+          .filter(d => d.decision_type === 'REJECT_CANDIDATE' || d.confirmed === false)
+          .map(d => Number(d.selected_rank || 0))
+          .filter(Boolean)
+      );
+
+      if (hasEscalation || (rejectedRanks.has(1) && rejectedRanks.has(2) && rejectedRanks.has(3))) {
+        return 'FINISHED (ESCALATED)';
+      }
+
+      return 'PENDING REVIEW';
+    }
+
+    return 'PENDING REVIEW';
   };
 
-  const isIncidentPending = (status: string) => {
-    return !isIncidentResolved(status) && !isIncidentEscalated(status);
+  // Helper check for status categories using decisions table
+  const isIncidentResolved = (inc: Incident) => {
+    return getIncidentEffectiveStatus(inc) === 'FINISHED (RESOLVED)';
+  };
+
+  const isIncidentEscalated = (inc: Incident) => {
+    return getIncidentEffectiveStatus(inc) === 'FINISHED (ESCALATED)';
+  };
+
+  const isIncidentPending = (inc: Incident) => {
+    return getIncidentEffectiveStatus(inc) === 'PENDING REVIEW';
   };
 
   // 4 Category Partitioned Lists
   const commonList = incidents;
-  const pendingList = incidents.filter(inc => isIncidentPending(inc.status));
-  const finishList = incidents.filter(inc => isIncidentResolved(inc.status));
-  const escalationList = incidents.filter(inc => isIncidentEscalated(inc.status));
+  const pendingList = incidents.filter(inc => isIncidentPending(inc));
+  const finishList = incidents.filter(inc => isIncidentResolved(inc));
+  const escalationList = incidents.filter(inc => isIncidentEscalated(inc));
 
   // Filtered incidents based on active Category, search, and severity
   const filteredIncidents = incidents.filter(inc => {
-    const matchesSearch = 
+    const matchesSearch =
       String(inc.id || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       String(inc.ticket_id || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       String(inc.location || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       String(inc.resource_type || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       String(inc.title || '').toLowerCase().includes(searchTerm.toLowerCase());
 
-    const matchesSeverity = 
+    const matchesSeverity =
       severityFilter === 'ALL' ||
       (severityFilter === 'HIGH' && inc.fault_severity === 2) ||
       (severityFilter === 'MED' && inc.fault_severity === 1) ||
       (severityFilter === 'LOW' && inc.fault_severity === 0);
 
-    const matchesCategory = 
+    const matchesCategory =
       selectedCategory === 'COMMON' ||
-      (selectedCategory === 'PENDING' && isIncidentPending(inc.status)) ||
-      (selectedCategory === 'FINISH' && isIncidentResolved(inc.status)) ||
-      (selectedCategory === 'ESCALATION' && isIncidentEscalated(inc.status));
+      (selectedCategory === 'PENDING' && isIncidentPending(inc)) ||
+      (selectedCategory === 'FINISH' && isIncidentResolved(inc)) ||
+      (selectedCategory === 'ESCALATION' && isIncidentEscalated(inc));
 
     return matchesSearch && matchesSeverity && matchesCategory;
   });
@@ -298,16 +334,16 @@ export default function NocDashboard() {
 
         {/* 4 Category Summary KPI Cards */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '16px', marginBottom: '24px' }}>
-          
+
           {/* Category 1: COMMON (Total Ingested from MongoDB) */}
-          <div 
+          <div
             onClick={() => {
               setActiveConsoleView('INCIDENTS');
               setSelectedCategory('COMMON');
             }}
-            className="glass-panel" 
-            style={{ 
-              padding: '18px 20px', 
+            className="glass-panel"
+            style={{
+              padding: '18px 20px',
               cursor: 'pointer',
               border: activeConsoleView === 'INCIDENTS' && selectedCategory === 'COMMON' ? '2px solid #38bdf8' : '1px solid rgba(255, 255, 255, 0.08)',
               background: activeConsoleView === 'INCIDENTS' && selectedCategory === 'COMMON' ? 'rgba(56, 189, 248, 0.08)' : undefined,
@@ -327,14 +363,14 @@ export default function NocDashboard() {
           </div>
 
           {/* Category 2: PENDING (Awaiting 3-Option Review) */}
-          <div 
+          <div
             onClick={() => {
               setActiveConsoleView('INCIDENTS');
               setSelectedCategory('PENDING');
             }}
-            className="glass-panel" 
-            style={{ 
-              padding: '18px 20px', 
+            className="glass-panel"
+            style={{
+              padding: '18px 20px',
               borderLeft: '4px solid #f59e0b',
               cursor: 'pointer',
               border: activeConsoleView === 'INCIDENTS' && selectedCategory === 'PENDING' ? '2px solid #f59e0b' : undefined,
@@ -355,14 +391,14 @@ export default function NocDashboard() {
           </div>
 
           {/* Category 3: FINISH (Resolved by YES) */}
-          <div 
+          <div
             onClick={() => {
               setActiveConsoleView('INCIDENTS');
               setSelectedCategory('FINISH');
             }}
-            className="glass-panel" 
-            style={{ 
-              padding: '18px 20px', 
+            className="glass-panel"
+            style={{
+              padding: '18px 20px',
               borderLeft: '4px solid #10b981',
               cursor: 'pointer',
               border: activeConsoleView === 'INCIDENTS' && selectedCategory === 'FINISH' ? '2px solid #10b981' : undefined,
@@ -383,14 +419,14 @@ export default function NocDashboard() {
           </div>
 
           {/* Category 4: ESCALATION (Tier-3 by 3x NO) */}
-          <div 
+          <div
             onClick={() => {
               setActiveConsoleView('INCIDENTS');
               setSelectedCategory('ESCALATION');
             }}
-            className="glass-panel" 
-            style={{ 
-              padding: '18px 20px', 
+            className="glass-panel"
+            style={{
+              padding: '18px 20px',
               borderLeft: '4px solid #ef4444',
               cursor: 'pointer',
               border: activeConsoleView === 'INCIDENTS' && selectedCategory === 'ESCALATION' ? '2px solid #ef4444' : undefined,
@@ -704,8 +740,8 @@ export default function NocDashboard() {
                         </tr>
                       ) : (
                         filteredIncidents.map((inc) => {
-                          const isResolved = isIncidentResolved(inc.status);
-                          const isEscalated = isIncidentEscalated(inc.status);
+                          const isResolved = isIncidentResolved(inc);
+                          const isEscalated = isIncidentEscalated(inc);
 
                           return (
                             <tr
