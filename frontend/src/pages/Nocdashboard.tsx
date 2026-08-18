@@ -3,7 +3,6 @@ import { useNavigate } from 'react-router-dom';
 import {
   Radio,
   Activity,
-  RefreshCw,
   Search,
   User,
   LogOut,
@@ -73,7 +72,6 @@ export default function NocDashboard() {
   const [selectedCategory, setSelectedCategory] = useState<MainCategory>('COMMON');
   const [viewMode, setViewMode] = useState<'table' | 'kanban'>('table');
 
-  const [loading, setLoading] = useState(true);
   const [currentUser, setCurrentUser] = useState<any>(null);
 
   // Load user session & poll live telemetry and decisions from MongoDB
@@ -100,7 +98,6 @@ export default function NocDashboard() {
   }, []);
 
   const fetchAllData = async () => {
-    setLoading(true);
     try {
       const [incRes, decRes] = await Promise.all([
         fetch(`${API_BASE_URL}/api/incidents`),
@@ -118,8 +115,6 @@ export default function NocDashboard() {
       }
     } catch {
       // Retain existing
-    } finally {
-      setLoading(false);
     }
   };
 

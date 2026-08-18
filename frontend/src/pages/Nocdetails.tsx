@@ -14,14 +14,11 @@ import {
   RefreshCw,
   Check,
   X,
-  FileText,
   MapPin,
   CheckCheck,
-  RotateCcw,
   PhoneForwarded,
   Info,
-  AlertOctagon,
-  ChevronRight
+  AlertOctagon
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
 
@@ -486,16 +483,6 @@ export default function NocDetails() {
           assigned_to: 'Tier-3 Senior NOC Engineering Team'
         });
       }
-    }
-  };
-
-  const handleResetEvaluation = () => {
-    setCommittedOption(null);
-    setEscalationData(null);
-    setSelectedOptionIndex(0);
-    setOptionsStatus({ 1: 'pending', 2: 'pending', 3: 'pending' });
-    if (incident) {
-      setIncident({ ...incident, status: 'INVESTIGATING' });
     }
   };
 

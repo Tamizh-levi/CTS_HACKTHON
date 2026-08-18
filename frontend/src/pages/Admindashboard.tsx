@@ -11,7 +11,6 @@ import {
   LogOut,
   Eye,
   X,
-  Lock,
   Database,
   FileText,
   AlertTriangle,
