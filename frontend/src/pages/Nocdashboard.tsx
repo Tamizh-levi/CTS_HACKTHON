@@ -1,38 +1,21 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Radio,
   Activity,
-  AlertOctagon,
-  AlertTriangle,
-  CheckCircle2,
   RefreshCw,
   Search,
-  Filter,
   User,
   LogOut,
-  Cpu,
   Database,
-  Truck,
-  Sparkles,
-  Flame,
-  Clock,
-  MapPin,
   Layers,
-  ChevronRight,
-  Wifi,
   PhoneForwarded,
   CheckCheck,
   LayoutGrid,
   List,
-  Hourglass,
-  Check,
   ArrowRight,
-  ShieldAlert,
   FileText,
-  Lock,
-  Eye,
-  Server
+  Eye
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
 
@@ -79,7 +62,6 @@ export default function NocDashboard() {
   const navigate = useNavigate();
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [decisions, setDecisions] = useState<OperatorDecision[]>([]);
-  const [dbSource, setDbSource] = useState<string>('MongoDB (cts_incident_management)');
   
   const [searchTerm, setSearchTerm] = useState('');
   const [severityFilter, setSeverityFilter] = useState<'ALL' | 'HIGH' | 'MED' | 'LOW'>('ALL');
@@ -128,7 +110,6 @@ export default function NocDashboard() {
       if (incRes.ok) {
         const incData = await incRes.json();
         setIncidents(incData.incidents || []);
-        if (incData.database) setDbSource(incData.database);
       }
 
       if (decRes.ok) {
@@ -152,7 +133,6 @@ export default function NocDashboard() {
       if (incRes.ok) {
         const incData = await incRes.json();
         if (incData.incidents) setIncidents(incData.incidents);
-        if (incData.database) setDbSource(incData.database);
       }
 
       if (decRes.ok) {

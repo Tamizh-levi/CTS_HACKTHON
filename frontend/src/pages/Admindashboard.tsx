@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   ShieldAlert,
@@ -8,7 +8,6 @@ import {
   Activity,
   UserCheck,
   Search,
-  RefreshCw,
   LogOut,
   Eye,
   X,
@@ -16,19 +15,9 @@ import {
   Database,
   FileText,
   AlertTriangle,
-  Radio,
   CheckCheck,
   BarChart3,
   UserPlus,
-  Plus,
-  ArrowRight,
-  TrendingUp,
-  Cpu,
-  Clock,
-  ShieldCheck,
-  Sliders,
-  Layers,
-  ChevronRight,
   Sparkles
 } from 'lucide-react';
 import API_BASE_URL from '../services/api';
@@ -90,7 +79,6 @@ export default function AdminDashboard() {
   const [users, setUsers] = useState<MongoUser[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [decisions, setDecisions] = useState<OperatorDecision[]>([]);
-  const [loading, setLoading] = useState(true);
 
   const [activeTab, setActiveTab] = useState<'overview' | 'operators' | 'decisions' | 'escalations'>('overview');
   const [searchTerm, setSearchTerm] = useState('');
@@ -141,7 +129,6 @@ export default function AdminDashboard() {
   }, []);
 
   const fetchAdminData = async () => {
-    setLoading(true);
     try {
       // 1. Fetch users from MongoDB
       const userRes = await fetch(`${API_BASE_URL}/api/auth/users`);
@@ -165,8 +152,6 @@ export default function AdminDashboard() {
       }
     } catch (err) {
       console.warn('Admin fetch notice:', err);
-    } finally {
-      setLoading(false);
     }
   };
 

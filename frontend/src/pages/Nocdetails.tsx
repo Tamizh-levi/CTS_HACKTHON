@@ -1,37 +1,23 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
   Sparkles,
   CheckCircle2,
-  XCircle,
-  AlertOctagon,
-  AlertTriangle,
   Cpu,
   Database,
   Truck,
-  Server,
   Activity,
   Layers,
   Wrench,
-  Clock,
   Shield,
   RefreshCw,
-  Send,
   Check,
   X,
   FileText,
   MapPin,
-  ChevronRight,
-  ChevronLeft,
   CheckCheck,
-  Lock,
   RotateCcw,
-  Sliders,
-  Flame,
-  Radio,
-  UserCheck,
-  Zap,
   PhoneForwarded,
   Info
 } from 'lucide-react';
@@ -86,6 +72,9 @@ interface IncidentData {
   confirmed_root_cause?: string;
   committed_at?: string;
   escalated_at?: string;
+  prediction?: any;
+  dispatch_result?: any;
+  agent_result?: any;
 }
 
 export default function NocDetails() {

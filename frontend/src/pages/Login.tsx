@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
   Radio, 
@@ -8,7 +8,6 @@ import {
   Lock, 
   User, 
   ArrowRight, 
-  CheckCircle2, 
   AlertTriangle,
   Server,
   Cpu
@@ -34,7 +33,7 @@ export default function Login() {
       .catch(() => setServerOnline(false));
   }, []);
 
-  const handleLogin = async (e?: React.FormEvent) => {
+  const handleLogin = async (e?: FormEvent) => {
     if (e) e.preventDefault();
     setIsLoading(true);
     setErrorMessage('');
