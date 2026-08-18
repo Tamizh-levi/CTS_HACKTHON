@@ -84,6 +84,7 @@ export default function AdminDashboard() {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedRoleFilter, setSelectedRoleFilter] = useState<'ALL' | 'operator' | 'admin' | 'field'>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'SOLVED' | 'PENDING' | 'ESCALATED'>('ALL');
+  const [decisionFilter, setDecisionFilter] = useState<'ALL' | 'COMMIT' | 'REJECT' | 'ESCALATION'>('ALL');
 
   // Selected Escalation Incident for Pop-up Modal
   const [selectedEscalation, setSelectedEscalation] = useState<{
@@ -297,13 +298,46 @@ export default function AdminDashboard() {
   const fieldRoleCount = users.filter((u) => u.role === 'field').length;
 
   const totalCommittedCount = decisions.filter(
-    (d) => d.decision_type === 'COMMIT_RESOLUTION' || d.confirmed === true
+    (d) =>
+      d.decision_type === 'COMMIT_RESOLUTION' ||
+      d.confirmed === true ||
+      String(d.decision_type || '').toUpperCase().includes('COMMIT')
+  ).length;
+
+  const totalRejectionsCount = decisions.filter(
+    (d) =>
+      (d.decision_type === 'REJECT_CANDIDATE' || d.confirmed === false) &&
+      d.decision_type !== 'ESCALATION_TO_TIER_3'
+  ).length;
+
+  const totalEscalatedDecisionsCount = decisions.filter(
+    (d) =>
+      d.decision_type === 'ESCALATION_TO_TIER_3' ||
+      String(d.decision_type || '').toUpperCase().includes('ESCALAT')
   ).length;
 
   const totalSolvedCount = incidents.filter(isIncidentResolved).length;
   const totalPendingCount = incidents.filter(isIncidentPending).length;
   const totalEscalatedCount = incidents.filter(isIncidentEscalated).length;
   const escalatedIncidents = incidents.filter(isIncidentEscalated);
+
+  // Filtered Decisions (Audit Trail)
+  const filteredDecisions = decisions.filter((dec) => {
+    const isCommit =
+      dec.decision_type === 'COMMIT_RESOLUTION' ||
+      dec.confirmed === true ||
+      String(dec.decision_type || '').toUpperCase().includes('COMMIT');
+    const isEsc =
+      dec.decision_type === 'ESCALATION_TO_TIER_3' ||
+      String(dec.decision_type || '').toUpperCase().includes('ESCALAT');
+    const isReject =
+      dec.decision_type === 'REJECT_CANDIDATE' || dec.confirmed === false;
+
+    if (decisionFilter === 'COMMIT') return isCommit;
+    if (decisionFilter === 'REJECT') return isReject && !isEsc;
+    if (decisionFilter === 'ESCALATION') return isEsc;
+    return true;
+  });
 
   // Filtered Users
   const filteredUsers = users.filter((u) => {
@@ -604,13 +638,16 @@ export default function AdminDashboard() {
 
           {/* Card 2: TOTAL COMMIT */}
           <div
-            onClick={() => setActiveTab('decisions')}
+            onClick={() => {
+              setActiveTab('decisions');
+              setDecisionFilter('COMMIT');
+            }}
             className="glass-panel"
             style={{
               padding: '18px',
               borderLeft: '4px solid #38bdf8',
               cursor: 'pointer',
-              border: activeTab === 'decisions' ? '2px solid #38bdf8' : undefined
+              border: activeTab === 'decisions' && decisionFilter === 'COMMIT' ? '2px solid #38bdf8' : undefined
             }}
           >
             <div
@@ -1345,106 +1382,268 @@ export default function AdminDashboard() {
             TAB 3: OPERATOR DECISIONS AUDIT (MongoDB Decisions Log)
         ============================================================ */}
         {activeTab === 'decisions' && (
-          <div className="glass-panel" style={{ overflow: 'hidden' }}>
+          <div className="glass-panel" style={{ overflow: 'hidden', padding: 0 }}>
+            {/* Header & Filter Bar */}
             <div
               style={{
-                padding: '16px 20px',
-                borderBottom: '1px solid rgba(255, 255, 255, 0.08)'
+                padding: '20px 24px',
+                borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                flexWrap: 'wrap',
+                gap: '16px',
+                background: 'linear-gradient(180deg, rgba(255,255,255,0.03) 0%, rgba(0,0,0,0) 100%)'
               }}
             >
-              <div style={{ fontSize: '15px', fontWeight: 800, color: '#f8fafc' }}>
-                Total Commits & Operator Decision History (MongoDB Audit Trail)
+              <div>
+                <div style={{ fontSize: '17px', fontWeight: 800, color: '#f8fafc', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <FileText size={18} color="#38bdf8" />
+                  <span>Total Commits & Decision Audit History</span>
+                  <span
+                    style={{
+                      fontSize: '11px',
+                      fontWeight: 700,
+                      color: '#38bdf8',
+                      background: 'rgba(56, 189, 248, 0.15)',
+                      padding: '2px 8px',
+                      borderRadius: '12px'
+                    }}
+                  >
+                    MongoDB Collection: decisions
+                  </span>
+                </div>
+                <div style={{ fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>
+                  Live immutable audit record of all YES resolution commits, NO rejections, and Tier-3 escalations.
+                </div>
               </div>
-              <div style={{ fontSize: '12px', color: '#94a3b8' }}>
-                Every YES commit, candidate rejection, and Tier-3 escalation is stored permanently in MongoDB.
+
+              {/* Filter Tabs */}
+              <div style={{ display: 'flex', gap: '6px', background: '#0a0d14', padding: '4px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)' }}>
+                {[
+                  { key: 'ALL', label: 'ALL', count: decisions.length, color: '#f8fafc' },
+                  { key: 'COMMIT', label: 'COMMITS', count: totalCommittedCount, color: '#34d399' },
+                  { key: 'REJECT', label: 'REJECTIONS', count: totalRejectionsCount, color: '#fbbf24' },
+                  { key: 'ESCALATION', label: 'ESCALATIONS', count: totalEscalatedDecisionsCount, color: '#f87171' }
+                ].map((tab) => (
+                  <button
+                    key={tab.key}
+                    onClick={() => setDecisionFilter(tab.key as any)}
+                    style={{
+                      background: decisionFilter === tab.key ? 'rgba(255, 255, 255, 0.1)' : 'transparent',
+                      color: decisionFilter === tab.key ? tab.color : '#94a3b8',
+                      border: decisionFilter === tab.key ? '1px solid rgba(255,255,255,0.15)' : '1px solid transparent',
+                      padding: '6px 12px',
+                      borderRadius: '6px',
+                      fontSize: '11px',
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      transition: 'all 0.15s ease'
+                    }}
+                  >
+                    <span>{tab.label}</span>
+                    <span
+                      style={{
+                        fontSize: '10px',
+                        background: 'rgba(0,0,0,0.3)',
+                        padding: '1px 6px',
+                        borderRadius: '10px'
+                      }}
+                    >
+                      {tab.count}
+                    </span>
+                  </button>
+                ))}
               </div>
             </div>
 
-            {decisions.length === 0 ? (
-              <div style={{ padding: '60px', textAlign: 'center', color: '#64748b' }}>
-                <FileText size={36} style={{ margin: '0 auto 10px', opacity: 0.4 }} />
+            {/* Quick Metrics Bar */}
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+                gap: '12px',
+                padding: '16px 24px',
+                background: 'rgba(0,0,0,0.2)',
+                borderBottom: '1px solid rgba(255, 255, 255, 0.05)'
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#38bdf8' }} />
                 <div>
-                  No decisions logged in MongoDB yet. Perform YES / NO actions on the NOC Console to record decisions.
+                  <div style={{ fontSize: '10px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase' }}>Total Actions Logged</div>
+                  <div style={{ fontSize: '14px', fontWeight: 800, color: '#f8fafc' }}>{decisions.length} Decisions</div>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#10b981' }} />
+                <div>
+                  <div style={{ fontSize: '10px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase' }}>Resolved via Commit</div>
+                  <div style={{ fontSize: '14px', fontWeight: 800, color: '#34d399' }}>{totalCommittedCount} Commits</div>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#f59e0b' }} />
+                <div>
+                  <div style={{ fontSize: '10px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase' }}>Candidates Rejected</div>
+                  <div style={{ fontSize: '14px', fontWeight: 800, color: '#fbbf24' }}>{totalRejectionsCount} Rejections</div>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#ef4444' }} />
+                <div>
+                  <div style={{ fontSize: '10px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase' }}>Tier-3 Escalations</div>
+                  <div style={{ fontSize: '14px', fontWeight: 800, color: '#f87171' }}>{totalEscalatedDecisionsCount} Escalated</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Decisions Table */}
+            {filteredDecisions.length === 0 ? (
+              <div style={{ padding: '60px 20px', textAlign: 'center', color: '#64748b' }}>
+                <FileText size={40} style={{ margin: '0 auto 12px', opacity: 0.3 }} />
+                <div style={{ fontSize: '14px', fontWeight: 600, color: '#94a3b8' }}>
+                  No decisions match filter "{decisionFilter}"
+                </div>
+                <div style={{ fontSize: '12px', marginTop: '4px' }}>
+                  Operator actions on the NOC console will automatically append to this table in real-time.
                 </div>
               </div>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column' }}>
-                {decisions.map((dec, idx) => {
-                  const isCommit =
-                    dec.decision_type === 'COMMIT_RESOLUTION' || dec.confirmed === true;
-                  const isEsc = dec.decision_type.includes('ESCALAT');
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
+                  <thead>
+                    <tr style={{ background: '#0a0d14', borderBottom: '1px solid rgba(255, 255, 255, 0.08)' }}>
+                      <th style={{ padding: '14px 20px', fontSize: '11px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Ticket ID</th>
+                      <th style={{ padding: '14px 20px', fontSize: '11px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Decision Action</th>
+                      <th style={{ padding: '14px 20px', fontSize: '11px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Root Cause & Resolution Summary</th>
+                      <th style={{ padding: '14px 20px', fontSize: '11px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Operator</th>
+                      <th style={{ padding: '14px 20px', fontSize: '11px', color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Timestamp</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredDecisions.map((dec, idx) => {
+                      const isCommit =
+                        dec.decision_type === 'COMMIT_RESOLUTION' ||
+                        dec.confirmed === true ||
+                        String(dec.decision_type || '').toUpperCase().includes('COMMIT');
+                      const isEsc =
+                        dec.decision_type === 'ESCALATION_TO_TIER_3' ||
+                        String(dec.decision_type || '').toUpperCase().includes('ESCALAT');
 
-                  return (
-                    <div
-                      key={idx}
-                      style={{
-                        padding: '16px 20px',
-                        borderBottom: '1px solid rgba(255, 255, 255, 0.04)',
-                        display: 'grid',
-                        gridTemplateColumns: '130px 180px 1.4fr 180px 180px',
-                        alignItems: 'center',
-                        gap: '16px'
-                      }}
-                    >
-                      <div>
-                        <span className="mono-tag" style={{ color: '#38bdf8', fontWeight: 700 }}>
-                          INC-{dec.ticket_id}
-                        </span>
-                      </div>
-
-                      <div>
-                        <span
+                      return (
+                        <tr
+                          key={idx}
                           style={{
-                            fontSize: '11px',
-                            fontWeight: 700,
-                            padding: '3px 8px',
-                            borderRadius: '10px',
-                            background: isCommit
-                              ? 'rgba(16, 185, 129, 0.2)'
-                              : isEsc
-                                ? 'rgba(239, 68, 68, 0.2)'
-                                : 'rgba(245, 158, 11, 0.2)',
-                            color: isCommit ? '#34d399' : isEsc ? '#f87171' : '#fbbf24'
+                            borderBottom: '1px solid rgba(255, 255, 255, 0.04)',
+                            transition: 'background 0.15s ease'
                           }}
+                          onMouseEnter={(e) => (e.currentTarget.style.background = 'rgba(255, 255, 255, 0.02)')}
+                          onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
                         >
-                          {isCommit
-                            ? 'COMMIT (YES)'
-                            : isEsc
-                              ? 'ESCALATION (3x NO)'
-                              : 'REJECT (NO)'}
-                        </span>
-                      </div>
+                          {/* 1. Ticket ID */}
+                          <td style={{ padding: '16px 20px', verticalAlign: 'middle' }}>
+                            <span className="mono-tag" style={{ color: '#38bdf8', fontWeight: 700, fontSize: '12px' }}>
+                              INC-{String(dec.ticket_id).replace(/^INC-/i, '')}
+                            </span>
+                          </td>
 
-                      <div>
-                        <div style={{ fontSize: '13px', fontWeight: 600, color: '#f8fafc' }}>
-                          {dec.root_cause || dec.reason || 'Decision recorded'}
-                        </div>
-                        {dec.resolution && (
-                          <div style={{ fontSize: '11px', color: '#94a3b8', marginTop: '2px' }}>
-                            Action: {dec.resolution}
-                          </div>
-                        )}
-                        {dec.commit_id && (
-                          <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px' }}>
-                            Ref: {dec.commit_id}
-                          </div>
-                        )}
-                      </div>
+                          {/* 2. Decision Badge */}
+                          <td style={{ padding: '16px 20px', verticalAlign: 'middle' }}>
+                            <span
+                              style={{
+                                fontSize: '11px',
+                                fontWeight: 700,
+                                padding: '4px 10px',
+                                borderRadius: '12px',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '6px',
+                                background: isCommit
+                                  ? 'rgba(16, 185, 129, 0.15)'
+                                  : isEsc
+                                    ? 'rgba(239, 68, 68, 0.15)'
+                                    : 'rgba(245, 158, 11, 0.15)',
+                                color: isCommit ? '#34d399' : isEsc ? '#f87171' : '#fbbf24',
+                                border: `1px solid ${
+                                  isCommit
+                                    ? 'rgba(16, 185, 129, 0.35)'
+                                    : isEsc
+                                      ? 'rgba(239, 68, 68, 0.35)'
+                                      : 'rgba(245, 158, 11, 0.35)'
+                                }`
+                              }}
+                            >
+                              {isCommit && <CheckCircle2 size={12} />}
+                              {isEsc && <PhoneForwarded size={12} />}
+                              {!isCommit && !isEsc && <Activity size={12} />}
+                              <span>
+                                {isCommit
+                                  ? 'COMMIT (YES)'
+                                  : isEsc
+                                    ? 'ESCALATION (3x NO)'
+                                    : `REJECT (NO - Rank #${dec.selected_rank || 1})`}
+                              </span>
+                            </span>
+                          </td>
 
-                      <div>
-                        <div style={{ fontSize: '11px', color: '#64748b' }}>OPERATOR</div>
-                        <div style={{ fontSize: '12px', color: '#e2e8f0', fontWeight: 600 }}>
-                          {dec.operator || 'NOC Operator'}
-                        </div>
-                      </div>
+                          {/* 3. Root Cause & Resolution */}
+                          <td style={{ padding: '16px 20px', verticalAlign: 'middle', maxWidth: '450px' }}>
+                            <div style={{ fontSize: '13px', fontWeight: 600, color: '#f8fafc', marginBottom: '2px' }}>
+                              {dec.root_cause || dec.reason || 'Telemetry Diagnosis'}
+                            </div>
+                            {dec.resolution && (
+                              <div style={{ fontSize: '11px', color: '#94a3b8', lineHeight: 1.4 }}>
+                                <strong style={{ color: '#cbd5e1' }}>Resolution:</strong> {dec.resolution}
+                              </div>
+                            )}
+                            {dec.commit_id && (
+                              <div style={{ fontSize: '10px', color: '#64748b', marginTop: '4px', fontFamily: 'monospace' }}>
+                                Commit Ref: {dec.commit_id}
+                              </div>
+                            )}
+                          </td>
 
-                      <div>
-                        <div style={{ fontSize: '11px', color: '#64748b' }}>TIMESTAMP</div>
-                        <div style={{ fontSize: '11px', color: '#94a3b8' }}>{dec.timestamp}</div>
-                      </div>
-                    </div>
-                  );
-                })}
+                          {/* 4. Operator */}
+                          <td style={{ padding: '16px 20px', verticalAlign: 'middle' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <div
+                                style={{
+                                  width: '24px',
+                                  height: '24px',
+                                  borderRadius: '50%',
+                                  background: 'rgba(56, 189, 248, 0.15)',
+                                  color: '#38bdf8',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  fontSize: '11px',
+                                  fontWeight: 700
+                                }}
+                              >
+                                {(dec.operator || 'N').charAt(0).toUpperCase()}
+                              </div>
+                              <span style={{ fontSize: '12px', color: '#e2e8f0', fontWeight: 600 }}>
+                                {dec.operator || 'NOC Operator'}
+                              </span>
+                            </div>
+                          </td>
+
+                          {/* 5. Timestamp */}
+                          <td style={{ padding: '16px 20px', verticalAlign: 'middle', color: '#94a3b8', fontSize: '11px', whiteSpace: 'nowrap' }}>
+                            {dec.timestamp}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>

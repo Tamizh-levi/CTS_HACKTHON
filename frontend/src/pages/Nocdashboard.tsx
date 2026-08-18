@@ -546,14 +546,14 @@ export default function NocDashboard() {
               </div>
             )}
 
-            <button
+            {/* <button
               onClick={fetchAllData}
               className="btn-secondary"
               style={{ padding: '6px 12px', fontSize: '11px' }}
             >
               <RefreshCw size={12} className={loading ? 'spin-slow' : ''} />
               <span>Sync from MongoDB</span>
-            </button>
+            </button> */}
           </div>
         </div>
 
