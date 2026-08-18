@@ -14,9 +14,11 @@ langchain-google-genai
 langchain-text-splitters
 langchain-ollama
 langgraph
-
+Flask
+gunicorn
 pymupdf
 python-docx
 
 numpy
 pandas
+flask-cors
