@@ -12,6 +12,8 @@ langchain-chroma
 langchain-huggingface
 langchain-google-genai
 langchain-text-splitters
+langchain-ollama
+langgraph
 
 pymupdf
 python-docx
